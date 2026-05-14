@@ -140,7 +140,8 @@ io.on("connection", (socket) => {
         handleMove(roomId, socket.id, card);
     });
 
-    // Server.js - மல்டிபிளேயர் லாஜிக்
+    // Server.js - மல்டிபிளேயர் கேம் லாஜிக்
+
     function handleMove(roomId, playerId, card) {
         const room = rooms[roomId];
         if (!room || !room.gameStarted) return;
@@ -148,6 +149,7 @@ io.on("connection", (socket) => {
         const player = room.players.find(p => p.id === playerId);
         if (!player) return;
 
+        // 1. பிளேயர் கையில் இருந்து கார்டை நீக்குதல்
         player.hand = player.hand.filter(c => c.id !== card.id);
         player.handCount = player.hand.length;
 
@@ -165,13 +167,15 @@ io.on("connection", (socket) => {
             }
         }
 
+        // கார்டு விளையாடியதை உடனே அப்டேட் செய்தல்
         io.to(roomId).emit("gameUpdated", {
             table: room.table,
-            currentTurn: null,
+            currentTurn: null, // அடுத்த லாஜிக் முடியும் வரை காத்திருக்கவும்
             players: room.players.map(({ hand, ...rest }) => rest)
         });
 
         setTimeout(() => {
+            if (room.table.length === 0) return; // ரூம் ரீசெட் ஆகியிருந்தால் தடுக்க
             const leadSuit = room.table[0].symbol;
 
             // --- 🚨 STRIKE LOGIC (வெட்டுதல்) ---
@@ -184,30 +188,36 @@ io.on("connection", (socket) => {
                 const loserId = highestInLead.playedBy;
                 const loserPlayer = room.players.find(p => p.id === loserId);
 
-                // 1. எல்லா கார்டுகளும் பிளேயர் கைக்குள் செல்லும்
-                loserPlayer.hand.push(...room.table);
-                loserPlayer.hand.sort((a, b) => b.val - a.val);
+                // 🚨 முக்கிய திருத்தம்: டேபிள் கார்டுகளை பிளேயரின் உண்மையான 'hand' அரே-ல் சேர்த்தல்
+                const tableCards = [...room.table];
+                loserPlayer.hand = [...loserPlayer.hand, ...tableCards];
+                loserPlayer.hand.sort((a, b) => b.val - a.val); // பெரிய கார்டு முதலில்
                 loserPlayer.handCount = loserPlayer.hand.length;
 
+                // அனிமேஷனுக்காக ஸ்ட்ரைக் ஈவென்ட் அனுப்புதல்
                 io.to(roomId).emit("strikeOccurred", {
                     loser: loserId,
                     table: room.table,
-                    nextTurn: loserId,
+                    nextTurn: loserId, // வெட்டு வாங்கியவரே மீண்டும் தொடங்க வேண்டும்
                     players: room.players.map(({ hand, ...rest }) => rest)
                 });
 
-                if (!loserPlayer.isBot) io.to(loserId).emit("yourCards", loserPlayer.hand);
+                // 🚨 மிக முக்கியம்: வெட்டு வாங்கிய பிளேயருக்கு அவரது புதிய கையை (Hand) உடனடியாக அனுப்புதல்
+                if (!loserPlayer.isBot) {
+                    io.to(loserId).emit("yourCards", loserPlayer.hand);
+                }
 
-                room.table = [];
+                room.table = []; // டேபிளைக் காலி செய்தல்
                 updateWinners(roomId);
 
-                // 2. கார்டுகளைப் பெற்ற பிறகு அவரே மீண்டும் புதிய கார்டைப் போட வேண்டும்
+                // வெட்டு வாங்கியவர் பாட் (Bot) என்றால் விளையாடச் சொல்லவும்
                 if (loserId.startsWith('bot-')) checkBotTurn(roomId, loserId);
                 return;
             }
 
-            // --- ROUND COMPLETE ---
+            // --- ROUND COMPLETE (சுற்று முடிதல்) ---
             const activeCount = room.players.filter(p => p.handCount > 0 || !room.winners.some(w => w.id === p.id)).length;
+
             if (room.table.length === activeCount) {
                 const highest = room.table.sort((a, b) => b.val - a.val)[0];
                 const roundWinnerId = highest.playedBy;
@@ -222,14 +232,17 @@ io.on("connection", (socket) => {
                 room.discardedPile.push(...room.table);
                 room.table = [];
                 updateWinners(roomId);
+
                 if (roundWinnerId.startsWith('bot-')) checkBotTurn(roomId, roundWinnerId);
             } else {
+                // அடுத்த பிளேயர் டர்ன்
                 let nextTurnId = getNextPlayer(roomId, playerId);
                 io.to(roomId).emit("gameUpdated", {
                     table: room.table,
                     currentTurn: nextTurnId,
                     players: room.players.map(({ hand, ...rest }) => rest)
                 });
+
                 if (nextTurnId.startsWith('bot-')) checkBotTurn(roomId, nextTurnId);
             }
         }, 1200);
