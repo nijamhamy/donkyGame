@@ -190,7 +190,6 @@ io.on("connection", (socket) => {
         player.hand = player.hand.filter(c => c.id !== card.id);
         player.handCount = player.hand.length;
 
-        // ✅ Immediately update winners after card play
         updateWinners(roomId);
 
         // stop game instantly if finished
@@ -267,10 +266,13 @@ io.on("connection", (socket) => {
             }
 
             // --- ROUND COMPLETE (சுற்று முடிதல்) ---
-            const activePlayersNow = room.players.filter(p => p.handCount > 0 || !room.winners.some(w => w.id === p.id)).length;
+            const activePlayersNow = room.players.filter(
+                p => p.hand.length > 0
+            ).length;
 
             if (room.table.length === activePlayersNow) {
-                const highest = room.table.sort((a, b) => b.val - a.val)[0];
+                const highest = [...room.table]
+                    .sort((a, b) => b.val - a.val)[0];
                 const roundWinnerId = highest.playedBy;
 
                 io.to(roomId).emit("roundComplete", {
@@ -288,6 +290,14 @@ io.on("connection", (socket) => {
             } else {
                 // அடுத்த பிளேயர் டர்ன்
                 let nextTurnId = getNextPlayer(roomId, playerId);
+
+                if (!nextTurnId) {
+
+                    updateWinners(roomId);
+
+                    return;
+                }
+
                 io.to(roomId).emit("gameUpdated", {
                     table: room.table,
                     currentTurn: nextTurnId,
@@ -368,6 +378,8 @@ io.on("connection", (socket) => {
         const bot = room.players.find(p => p.id === botId);
         if (!bot || !bot.isBot || room.winners.some(w => w.id === botId)) return;
 
+        if (bot.handCount <= 0) return;
+
         setTimeout(() => {
             let cardToPlay;
             const turnOrder = room.players.map(p => p.id);
@@ -404,7 +416,8 @@ io.on("connection", (socket) => {
                     cardToPlay = sameSuit.find(c => c.val > currentHigh.val) || sameSuit[0];
                 } else {
                     // வெட்டுவதற்கு தன்னிடம் உள்ள மிகப்பெரிய கார்டைப் பயன்படுத்தும்
-                    cardToPlay = bot.hand.sort((a, b) => b.val - a.val)[bot.hand.length - 1];
+                    cardToPlay = [...bot.hand]
+                        .sort((a, b) => a.val - b.val)[0];
                 }
             }
 
