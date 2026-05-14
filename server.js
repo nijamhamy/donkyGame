@@ -146,17 +146,37 @@ io.on("connection", (socket) => {
 
     function getNextPlayer(roomId, currentPlayerId) {
         const room = rooms[roomId];
-        const playerIndex = room.players.findIndex(p => p.id === currentPlayerId);
 
-        for (let i = 1; i <= 4; i++) {
-            const nextIdx = (playerIndex + i) % 4;
-            const nextP = room.players[nextIdx];
+        if (!room || !room.players.length) return null;
 
-            // கார்டு வைத்திருப்பவரை மற்றும் வெற்றி பெறாதவரை மட்டுமே தேர்ந்தெடுக்க வேண்டும்
-            if (nextP.handCount > 0 && !room.winners.some(w => w.id === nextP.id)) {
-                return nextP.id;
+        const playerIndex = room.players.findIndex(
+            p => p.id === currentPlayerId
+        );
+
+        if (playerIndex === -1) return null;
+
+        // maximum 4 players rotation
+        for (let i = 1; i <= room.players.length; i++) {
+
+            const nextIdx = (playerIndex + i) % room.players.length;
+            const nextPlayer = room.players[nextIdx];
+
+            const isWinner = room.winners.some(
+                w => w.id === nextPlayer.id
+            );
+
+            // ✅ STRICT SKIP LOGIC
+            if (
+                nextPlayer &&
+                nextPlayer.handCount > 0 &&
+                !isWinner
+            ) {
+                return nextPlayer.id;
             }
         }
+
+        // no valid players left
+        return null;
     }
 
     function handleMove(roomId, playerId, card) {
@@ -169,6 +189,14 @@ io.on("connection", (socket) => {
         // 1. பிளேயர் கையில் இருந்து கார்டை நீக்குதல்
         player.hand = player.hand.filter(c => c.id !== card.id);
         player.handCount = player.hand.length;
+
+        // ✅ Immediately update winners after card play
+        updateWinners(roomId);
+
+        // stop game instantly if finished
+        if (!rooms[roomId]?.gameStarted) {
+            return;
+        }
 
         const playedCard = { ...card, playedBy: playerId };
         room.table.push(playedCard);
@@ -272,18 +300,64 @@ io.on("connection", (socket) => {
     }
 
     function updateWinners(roomId) {
+
         const room = rooms[roomId];
-        room.players.forEach(p => {
-            if (p.handCount === 0 && !room.winners.some(w => w.id === p.id)) {
-                room.winners.push({ id: p.id, name: p.name, rank: room.winners.length + 1 });
-                io.to(roomId).emit("playersUpdated", room.players.map(({ hand, ...rest }) => rest));
+
+        if (!room) return;
+
+        // ✅ Add new winners immediately
+        room.players.forEach(player => {
+
+            const alreadyWinner = room.winners.some(
+                w => w.id === player.id
+            );
+
+            if (
+                player.handCount === 0 &&
+                !alreadyWinner
+            ) {
+
+                room.winners.push({
+                    id: player.id,
+                    name: player.name,
+                    rank: room.winners.length + 1
+                });
             }
         });
-        if (room.winners.length === 3) {
-            const donkey = room.players.find(p => !room.winners.some(w => w.id === p.id));
-            if (donkey) room.winners.push({ id: donkey.id, name: donkey.name, rank: 4 });
+
+        // update everyone
+        io.to(roomId).emit(
+            "playersUpdated",
+            room.players.map(({ hand, ...rest }) => rest)
+        );
+
+        // ✅ GAME FINISH CONDITION
+        if (room.winners.length >= 3) {
+
+            // find remaining donkey player
+            const donkey = room.players.find(
+                p => !room.winners.some(w => w.id === p.id)
+            );
+
+            // add donkey only once
+            if (
+                donkey &&
+                !room.winners.some(w => w.id === donkey.id)
+            ) {
+                room.winners.push({
+                    id: donkey.id,
+                    name: donkey.name,
+                    rank: 4
+                });
+            }
+
             room.gameStarted = false;
-            io.to(roomId).emit("gameFinished", { winners: room.winners });
+
+            io.to(roomId).emit("gameFinished", {
+                winners: room.winners
+            });
+
+            console.log(`🏁 Game Finished in Room ${roomId}`);
         }
     }
 
