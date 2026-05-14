@@ -207,18 +207,27 @@ io.on("connection", (socket) => {
                 // மேஜையில் உள்ள அத்தனை கார்டுகளையும் எடுத்தல்
                 const cardsFromTable = [...room.table];
                 loserPlayer.hand = [...loserPlayer.hand, ...cardsFromTable];
-                loserPlayer.hand.sort((a, b) => b.val - a.val);
-                loserPlayer.handCount = loserPlayer.hand.length;
+                loserPlayer.hand.sort((a, b) => {
+                    const suitOrder = {
+                        'Spades': 0,
+                        'Hearts': 1,
+                        'Diamonds': 2,
+                        'Clubs': 3
+                    };
 
-                // 🚨 முக்கியம்: முதலில் கார்டுகளை பிளேயருக்கு அனுப்பிவிட்டு, பிறகு ஸ்ட்ரைக் ஈவென்ட் அனுப்பவும்
-                if (!loserPlayer.isBot) {
-                    io.to(loserId).emit("yourCards", loserPlayer.hand);
-                }
+                    if (suitOrder[a.name] !== suitOrder[b.name]) {
+                        return suitOrder[a.name] - suitOrder[b.name];
+                    }
+
+                    return a.val - b.val;
+                });
+                loserPlayer.handCount = loserPlayer.hand.length;
 
                 io.to(roomId).emit("strikeOccurred", {
                     loser: loserId,
                     table: room.table,
                     nextTurn: loserId,
+                    updatedHand: loserPlayer.hand, // ✅ important
                     players: room.players.map(({ hand, ...rest }) => rest)
                 });
 
