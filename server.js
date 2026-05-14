@@ -215,10 +215,11 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            // --- ROUND COMPLETE (சுற்று முடிதல்) ---
-            const activeCount = room.players.filter(p => p.handCount > 0 || !room.winners.some(w => w.id === p.id)).length;
+            // --- 🚨 FIX: ROUND COMPLETE (சுற்று முடிதல் கணக்கீடு) ---
+            // 'activeCount' என்பது கார்டுகள் முடித்து வெளியேறியவர்களைத் தவிா்த்து கணக்கிட வேண்டும்
+            const activePlayersNow = room.players.filter(p => p.handCount > 0 || !room.winners.some(w => w.id === p.id)).length;
 
-            if (room.table.length === activeCount) {
+            if (room.table.length === activePlayersNow) {
                 const highest = room.table.sort((a, b) => b.val - a.val)[0];
                 const roundWinnerId = highest.playedBy;
 
@@ -248,13 +249,20 @@ io.on("connection", (socket) => {
         }, 1200);
     }
 
+    // 1. அடுத்த பிளேயரை முடிவு செய்யும் பங்க்ஷன் (கார்டு முடித்தவர்களைத் தவிர்க்கும்)
     function getNextPlayer(roomId, currentPlayerId) {
         const room = rooms[roomId];
         const playerIndex = room.players.findIndex(p => p.id === currentPlayerId);
+
         for (let i = 1; i <= 4; i++) {
             const nextIdx = (playerIndex + i) % 4;
             const nextP = room.players[nextIdx];
-            if (!room.winners.some(w => w.id === nextP.id)) return nextP.id;
+
+            // 🚨 கார்டு இன்னும் கையில் வைத்திருப்பவரை (handCount > 0) 
+            // மற்றும் இன்னும் வெற்றி பெறாதவரை மட்டுமே அடுத்த பிளேயராகத் தேர்ந்தெடுக்க வேண்டும்
+            if (nextP.handCount > 0 && !room.winners.some(w => w.id === nextP.id)) {
+                return nextP.id;
+            }
         }
     }
 
