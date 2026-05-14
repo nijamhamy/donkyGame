@@ -64,24 +64,112 @@ io.on("connection", (socket) => {
 
     // 2. ரூமில் இணைதல்
     socket.on("joinRoom", ({ roomId, playerName }, callback) => {
+
         const room = rooms[roomId];
-        if (room && room.players.length < 4 && !room.gameStarted) {
-            room.players.push({
-                id: socket.id,
-                name: playerName,
-                host: false,
-                isBot: false,
-                hand: [],
-                handCount: 0,
-                isConnected: true // ஆன்லைன் ஸ்டேட்டஸ்
+
+        if (!room) {
+            return callback({
+                success: false,
+                message: "Room not found!"
             });
-            socket.join(roomId);
-            // எல்லாருக்கும் பிளேயர் லிஸ்ட் அப்டேட்
-            io.to(roomId).emit("playersUpdated", room.players.map(({ hand, ...rest }) => rest));
-            callback({ success: true });
-        } else {
-            callback({ success: false, message: "Room error or full!" });
         }
+
+        if (room.gameStarted) {
+            return callback({
+                success: false,
+                message: "Game already started!"
+            });
+        }
+
+        // ✅ Check same socket already exists
+        const existingBySocket = room.players.find(
+            p => p.id === socket.id
+        );
+
+        if (existingBySocket) {
+
+            existingBySocket.isConnected = true;
+
+            socket.join(roomId);
+
+            io.to(roomId).emit(
+                "playersUpdated",
+                room.players.map(({ hand, ...rest }) => rest)
+            );
+
+            return callback({
+                success: true,
+                rejoined: true
+            });
+        }
+
+        // ✅ Check same player name exists
+        const existingByName = room.players.find(
+            p =>
+                !p.isBot &&
+                p.name.trim().toLowerCase() === playerName.trim().toLowerCase()
+        );
+
+        // ✅ RECONNECT LOGIC
+        if (existingByName) {
+
+            console.log("Reconnecting player:", existingByName.name);
+
+            existingByName.id = socket.id;
+            existingByName.isConnected = true;
+
+            socket.join(roomId);
+
+            io.to(roomId).emit(
+                "playersUpdated",
+                room.players.map(({ hand, ...rest }) => rest)
+            );
+
+            // restore cards if game already started
+            if (existingByName.hand?.length > 0) {
+                io.to(socket.id).emit(
+                    "yourCards",
+                    existingByName.hand
+                );
+            }
+
+            return callback({
+                success: true,
+                rejoined: true
+            });
+        }
+
+        // ✅ prevent room overflow
+        const realPlayers = room.players.filter(p => !p.isBot);
+
+        if (realPlayers.length >= 4) {
+            return callback({
+                success: false,
+                message: "Room full!"
+            });
+        }
+
+        // ✅ ADD NEW PLAYER
+        room.players.push({
+            id: socket.id,
+            name: playerName.trim(),
+            host: false,
+            isBot: false,
+            hand: [],
+            handCount: 0,
+            isConnected: true
+        });
+
+        socket.join(roomId);
+
+        io.to(roomId).emit(
+            "playersUpdated",
+            room.players.map(({ hand, ...rest }) => rest)
+        );
+
+        callback({
+            success: true
+        });
     });
 
     // 3. ஆட்டத்தைத் தொடங்குதல்
@@ -426,28 +514,45 @@ io.on("connection", (socket) => {
     }
 
     // --- 🚨 NEW: CONNECTION TRACKING LOGIC ---
-    socket.on("disconnect", () => {
-        console.log("Disconnected:", socket.id);
-        for (const roomId in rooms) {
-            const room = rooms[roomId];
-            const playerIndex = room.players.findIndex(p => p.id === socket.id);
-            if (playerIndex !== -1) {
-                // பிளேயரை ஆஃப்லைனில் மாற்றுதல்
-                room.players[playerIndex].isConnected = false;
+socket.on("disconnect", () => {
 
-                // மற்ற பிளேயர்களுக்கு இந்த தகவலை அனுப்புதல்
-                io.to(roomId).emit("playersUpdated", room.players.map(({ hand, ...rest }) => rest));
+    console.log("Disconnected:", socket.id);
 
-                // ஒருவேளை எல்லாரும் டிஸ்கனெக்ட் ஆனால் ரூமை நீக்கலாம் (Optional)
-                const anyOnline = room.players.some(p => p.isConnected && !p.isBot);
-                if (!anyOnline) {
-                    console.log(`Closing empty room: ${roomId}`);
-                    delete rooms[roomId];
-                }
-                break;
-            }
+    for (const roomId in rooms) {
+
+        const room = rooms[roomId];
+
+        const player = room.players.find(
+            p => p.id === socket.id
+        );
+
+        if (!player) continue;
+
+        // ✅ mark offline only
+        player.isConnected = false;
+
+        console.log(`${player.name} went offline`);
+
+        io.to(roomId).emit(
+            "playersUpdated",
+            room.players.map(({ hand, ...rest }) => rest)
+        );
+
+        // ✅ remove room if no humans online
+        const humansOnline = room.players.some(
+            p => !p.isBot && p.isConnected
+        );
+
+        if (!humansOnline) {
+
+            console.log(`Deleting empty room ${roomId}`);
+
+            delete rooms[roomId];
         }
-    });
+
+        break;
+    }
+});
 });
 
 // பழைய வரியை நீக்கிவிட்டு இதைச் சேர்க்கவும்
