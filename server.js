@@ -140,35 +140,19 @@ io.on("connection", (socket) => {
         handleMove(roomId, socket.id, card);
     });
 
-    // Server.js - மல்டிபிளேயர் கேம் லாஜிக்
-
-    // 2. பிரதான கேம் பிளே பங்க்ஷன்
     function handleMove(roomId, playerId, card) {
         const room = rooms[roomId];
-        if (!room || !room.gameStarted) return;
+        if (!room) return;
 
         const player = room.players.find(p => p.id === playerId);
         if (!player) return;
 
-        // பிளேயர் கையில் இருந்து கார்டை நீக்குதல்
         player.hand = player.hand.filter(c => c.id !== card.id);
         player.handCount = player.hand.length;
 
         const playedCard = { ...card, playedBy: playerId };
         room.table.push(playedCard);
 
-        // AI Memory: யார் எந்த சூட்டை வெட்டினார்கள் என்று குறித்துக்கொள்ளும்
-        if (room.table.length > 1) {
-            const leadS = room.table[0].symbol;
-            if (playedCard.symbol !== leadS) {
-                if (!room.missingCards[playerId]) room.missingCards[playerId] = [];
-                if (!room.missingCards[playerId].includes(leadS)) {
-                    room.missingCards[playerId].push(leadS);
-                }
-            }
-        }
-
-        // கார்டு விளையாடியதை உடனே அப்டேட் செய்தல்
         io.to(roomId).emit("gameUpdated", {
             table: room.table,
             currentTurn: null,
@@ -176,30 +160,18 @@ io.on("connection", (socket) => {
         });
 
         setTimeout(() => {
-            if (!room.table || room.table.length === 0) return;
+            if (room.table.length === 0) return;
             const leadSuit = room.table[0].symbol;
 
-            // --- 🚨 STRIKE LOGIC (வெட்டுதல்) ---
             if (playedCard.symbol !== leadSuit) {
-                const highestInLead = room.table
-                    .filter(c => c.symbol === leadSuit)
-                    .sort((a, b) => b.val - a.val)[0];
-
+                const highestInLead = room.table.filter(c => c.symbol === leadSuit).sort((a, b) => b.val - a.val)[0];
                 const loserId = highestInLead.playedBy;
                 const loserPlayer = room.players.find(p => p.id === loserId);
 
-                // 🚨 முக்கிய திருத்தம்: மேஜையில் உள்ள அத்தனை கார்டுகளையும் (உதாரணம்: K, 10, 5, Q) எடுத்தல்
-                const cardsFromTable = [...room.table];
-                loserPlayer.hand = [...loserPlayer.hand, ...cardsFromTable];
+                loserPlayer.hand.push(...room.table);
                 loserPlayer.hand.sort((a, b) => b.val - a.val);
                 loserPlayer.handCount = loserPlayer.hand.length;
 
-                // வெட்டு வாங்கியவருக்கு மட்டும் கார்டுகளை அனுப்புதல் (Sync Fix)
-                if (!loserPlayer.isBot) {
-                    io.to(loserId).emit("yourCards", loserPlayer.hand);
-                }
-
-                // மற்றவர்களுக்கு கார்டு எண்ணிக்கையை அப்டேட் செய்தல்
                 io.to(roomId).emit("strikeOccurred", {
                     loser: loserId,
                     table: room.table,
@@ -207,59 +179,45 @@ io.on("connection", (socket) => {
                     players: room.players.map(({ hand, ...rest }) => rest)
                 });
 
+                if (!loserPlayer.isBot) io.to(loserId).emit("yourCards", loserPlayer.hand);
                 room.table = [];
                 updateWinners(roomId);
-
-                if (loserId.startsWith('bot-')) checkBotTurn(roomId, loserId);
-                return;
+                checkBotTurn(roomId, loserId);
             }
-
-            // --- 🚨 ROUND COMPLETE (சுற்று முடிதல்) ---
-            // தற்போது ஆட்டத்தில் கார்டுகள் வைத்திருப்பவர்களின் எண்ணிக்கை
-            const activePlayersNow = room.players.filter(p => p.handCount > 0 || !room.winners.some(w => w.id === p.id)).length;
-
-            if (room.table.length === activePlayersNow) {
+            else if (room.table.length === (room.players.filter(p => p.handCount > 0 || !room.winners.some(w => w.id === p.id)).length)) {
                 const highest = room.table.sort((a, b) => b.val - a.val)[0];
-                const roundWinnerId = highest.playedBy;
+                const winnerId = highest.playedBy;
 
                 io.to(roomId).emit("roundComplete", {
-                    winner: roundWinnerId,
+                    winner: winnerId,
                     table: room.table,
-                    nextTurn: roundWinnerId,
+                    nextTurn: winnerId,
                     players: room.players.map(({ hand, ...rest }) => rest)
                 });
-
                 room.discardedPile.push(...room.table);
                 room.table = [];
                 updateWinners(roomId);
-
-                if (roundWinnerId.startsWith('bot-')) checkBotTurn(roomId, roundWinnerId);
-            } else {
-                // அடுத்த பிளேயர் டர்ன்
+                checkBotTurn(roomId, winnerId);
+            }
+            else {
                 let nextTurnId = getNextPlayer(roomId, playerId);
                 io.to(roomId).emit("gameUpdated", {
                     table: room.table,
                     currentTurn: nextTurnId,
                     players: room.players.map(({ hand, ...rest }) => rest)
                 });
-
-                if (nextTurnId && nextTurnId.startsWith('bot-')) checkBotTurn(roomId, nextTurnId);
+                checkBotTurn(roomId, nextTurnId);
             }
-        }, 1200);
+        }, 1000);
     }
 
     function getNextPlayer(roomId, currentPlayerId) {
         const room = rooms[roomId];
         const playerIndex = room.players.findIndex(p => p.id === currentPlayerId);
-
         for (let i = 1; i <= 4; i++) {
             const nextIdx = (playerIndex + i) % 4;
             const nextP = room.players[nextIdx];
-
-            // கார்டு இன்னும் கையில் வைத்திருப்பவரை மட்டுமே அடுத்த பிளேயராகத் தேர்ந்தெடுக்க வேண்டும்
-            if (nextP.handCount > 0 && !room.winners.some(w => w.id === nextP.id)) {
-                return nextP.id;
-            }
+            if (!room.winners.some(w => w.id === nextP.id)) return nextP.id;
         }
     }
 
@@ -279,53 +237,23 @@ io.on("connection", (socket) => {
         }
     }
 
-    // 2. AI BOT TACTICAL LOGIC (பாதுகாப்பு விதிகள்)
     function checkBotTurn(roomId, botId) {
         const room = rooms[roomId];
-        if (!room || !room.gameStarted) return;
+        if (!room) return;
         const bot = room.players.find(p => p.id === botId);
         if (!bot || !bot.isBot || room.winners.some(w => w.id === botId)) return;
 
         setTimeout(() => {
+            if (!room.table) return;
             let cardToPlay;
-            const turnOrder = room.players.map(p => p.id);
-            const nextPlayerId = turnOrder[(turnOrder.indexOf(botId) + 1) % 4];
-
             if (room.table.length === 0) {
-                // HIGH-VALUE PROTECTION:
-                // அடுத்த பிளேயரிடம் எந்த சூட் இல்லை (Missing) என்பதைப் பார்த்து, 
-                // அந்த சூட்டில் உள்ள பெரிய கார்டுகளை (A, K) தற்காத்துக் கொள்ளும்.
-                const nextMissing = room.missingCards[nextPlayerId] || [];
-
-                // அடுத்த பிளேயரிடம் இருக்கும் என நம்பப்படும் "Safe" சூட்டைத் தேடுதல்
-                let safeCards = bot.hand.filter(c => !nextMissing.includes(c.symbol));
-
-                if (safeCards.length > 0) {
-                    // பாதுகாப்பான சூட்டில் சிறிய கார்டைப் போட்டு ஆட்டத்தைத் தொடங்கும்
-                    cardToPlay = safeCards.sort((a, b) => a.val - b.val)[0];
-                } else {
-                    // வேறு வழியில்லை என்றால் மிகச்சிறிய கார்டைப் போடும்
-                    cardToPlay = bot.hand.sort((a, b) => a.val - b.val)[0];
-                }
-
-                // ஆட்டத்தின் ஆரம்பம் எனில் Ace of Spades கட்டாயம்
                 const aceSpade = bot.hand.find(c => c.symbol === '♠' && c.label === 'A' && room.discardedPile.length === 0);
-                if (aceSpade) cardToPlay = aceSpade;
-
+                cardToPlay = aceSpade || bot.hand[bot.hand.length - 1];
             } else {
                 const leadSuit = room.table[0].symbol;
-                const sameSuit = bot.hand.filter(c => c.symbol === leadSuit).sort((a, b) => a.val - b.val);
-
-                if (sameSuit.length > 0) {
-                    const currentHigh = [...room.table].filter(c => c.symbol === leadSuit).sort((a, b) => b.val - a.val)[0];
-                    // தன்னிடம் வெல்லும் கார்டு (A/K) இருந்தால் அதைப் போட்டு தப்பிக்கும்
-                    cardToPlay = sameSuit.find(c => c.val > currentHigh.val) || sameSuit[0];
-                } else {
-                    // வெட்டுவதற்கு தன்னிடம் உள்ள மிகப்பெரிய கார்டைப் பயன்படுத்தும்
-                    cardToPlay = bot.hand.sort((a, b) => b.val - a.val)[bot.hand.length - 1];
-                }
+                const sameSuitCards = bot.hand.filter(c => c.symbol === leadSuit).sort((a, b) => b.val - a.val);
+                cardToPlay = sameSuitCards.length > 0 ? sameSuitCards[0] : bot.hand[0];
             }
-
             if (cardToPlay) handleMove(roomId, botId, cardToPlay);
         }, 1500);
     }
