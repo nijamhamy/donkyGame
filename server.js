@@ -234,36 +234,25 @@ io.on("connection", (socket) => {
 
     function getNextPlayer(roomId, currentPlayerId) {
         const room = rooms[roomId];
-
         if (!room || !room.players.length) return null;
 
-        const playerIndex = room.players.findIndex(
-            p => p.id === currentPlayerId
-        );
-
+        const playerIndex = room.players.findIndex(p => p.id === currentPlayerId);
         if (playerIndex === -1) return null;
 
-        // maximum 4 players rotation
         for (let i = 1; i <= room.players.length; i++) {
-
             const nextIdx = (playerIndex + i) % room.players.length;
             const nextPlayer = room.players[nextIdx];
 
-            const isWinner = room.winners.some(
-                w => w.id === nextPlayer.id
-            );
+            const isWinner = room.winners.some(w => w.id === nextPlayer.id);
 
-            // ✅ STRICT SKIP LOGIC
-            if (
-                nextPlayer &&
-                nextPlayer.handCount > 0 &&
-                !isWinner
-            ) {
+            // ✅ FIX: must check BOTH conditions properly
+            const hasCards = (nextPlayer.hand?.length ?? 0) > 0;
+
+            if (nextPlayer && hasCards && !isWinner) {
                 return nextPlayer.id;
             }
         }
 
-        // no valid players left
         return null;
     }
 
@@ -280,8 +269,15 @@ io.on("connection", (socket) => {
 
         updateWinners(roomId);
 
+
         // stop game instantly if finished
         if (!rooms[roomId]?.gameStarted) {
+            room.table = [];
+            io.to(roomId).emit("gameUpdated", {
+                table: [],
+                currentTurn: null,
+                players: room.players.map(({ hand, ...rest }) => rest)
+            });
             return;
         }
 
@@ -354,9 +350,12 @@ io.on("connection", (socket) => {
             }
 
             // --- ROUND COMPLETE (சுற்று முடிதல்) ---
-            const activePlayersNow = room.players.filter(
-                p => p.hand.length > 0
+            const activePlayersNow = room.players.filter(p =>
+                p.hand.length > 0 &&
+                !room.winners.some(w => w.id === p.id)
             ).length;
+
+            if (activePlayersNow === 0) return;
 
             if (room.table.length === activePlayersNow) {
                 const highest = [...room.table]
@@ -398,50 +397,40 @@ io.on("connection", (socket) => {
     }
 
     function updateWinners(roomId) {
-
         const room = rooms[roomId];
-
         if (!room) return;
 
-        // ✅ Add new winners immediately
         room.players.forEach(player => {
 
-            const alreadyWinner = room.winners.some(
-                w => w.id === player.id
-            );
+            const alreadyWinner = room.winners.some(w => w.id === player.id);
 
-            if (
-                player.handCount === 0 &&
-                !alreadyWinner
-            ) {
-
+            // ✅ FIX: use hand.length ONLY (handCount bug avoid)
+            if (player.hand.length === 0 && !alreadyWinner) {
                 room.winners.push({
                     id: player.id,
                     name: player.name,
                     rank: room.winners.length + 1
                 });
+
+                console.log(`🏆 Winner added: ${player.name}`);
             }
         });
 
-        // update everyone
         io.to(roomId).emit(
             "playersUpdated",
             room.players.map(({ hand, ...rest }) => rest)
         );
 
-        // ✅ GAME FINISH CONDITION
-        if (room.winners.length >= 3) {
+        // ✅ GAME END CHECK
+        const totalFinished = room.winners.length;
 
-            // find remaining donkey player
+        if (totalFinished >= 3) {
+
             const donkey = room.players.find(
                 p => !room.winners.some(w => w.id === p.id)
             );
 
-            // add donkey only once
-            if (
-                donkey &&
-                !room.winners.some(w => w.id === donkey.id)
-            ) {
+            if (donkey) {
                 room.winners.push({
                     id: donkey.id,
                     name: donkey.name,
@@ -454,8 +443,6 @@ io.on("connection", (socket) => {
             io.to(roomId).emit("gameFinished", {
                 winners: room.winners
             });
-
-            console.log(`🏁 Game Finished in Room ${roomId}`);
         }
     }
 
@@ -466,8 +453,7 @@ io.on("connection", (socket) => {
         const bot = room.players.find(p => p.id === botId);
         if (!bot || !bot.isBot || room.winners.some(w => w.id === botId)) return;
 
-        if (bot.handCount <= 0) return;
-
+        if (bot.hand.length <= 0 || room.winners.some(w => w.id === botId)) return;
         setTimeout(() => {
             let cardToPlay;
             const turnOrder = room.players.map(p => p.id);
@@ -514,45 +500,45 @@ io.on("connection", (socket) => {
     }
 
     // --- 🚨 NEW: CONNECTION TRACKING LOGIC ---
-socket.on("disconnect", () => {
+    socket.on("disconnect", () => {
 
-    console.log("Disconnected:", socket.id);
+        console.log("Disconnected:", socket.id);
 
-    for (const roomId in rooms) {
+        for (const roomId in rooms) {
 
-        const room = rooms[roomId];
+            const room = rooms[roomId];
 
-        const player = room.players.find(
-            p => p.id === socket.id
-        );
+            const player = room.players.find(
+                p => p.id === socket.id
+            );
 
-        if (!player) continue;
+            if (!player) continue;
 
-        // ✅ mark offline only
-        player.isConnected = false;
+            // ✅ mark offline only
+            player.isConnected = false;
 
-        console.log(`${player.name} went offline`);
+            console.log(`${player.name} went offline`);
 
-        io.to(roomId).emit(
-            "playersUpdated",
-            room.players.map(({ hand, ...rest }) => rest)
-        );
+            io.to(roomId).emit(
+                "playersUpdated",
+                room.players.map(({ hand, ...rest }) => rest)
+            );
 
-        // ✅ remove room if no humans online
-        const humansOnline = room.players.some(
-            p => !p.isBot && p.isConnected
-        );
+            // ✅ remove room if no humans online
+            const humansOnline = room.players.some(
+                p => !p.isBot && p.isConnected
+            );
 
-        if (!humansOnline) {
+            if (!humansOnline) {
 
-            console.log(`Deleting empty room ${roomId}`);
+                console.log(`Deleting empty room ${roomId}`);
 
-            delete rooms[roomId];
+                delete rooms[roomId];
+            }
+
+            break;
         }
-
-        break;
-    }
-});
+    });
 });
 
 // பழைய வரியை நீக்கிவிட்டு இதைச் சேர்க்கவும்
