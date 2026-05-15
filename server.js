@@ -105,6 +105,12 @@ const emitPlayersUpdated = (roomId) => {
     io.to(roomId).emit("playersUpdated", getPublicPlayers(room));
 };
 
+const emitWinnersUpdated = (roomId) => {
+    const room = rooms[roomId];
+    if (!room) return;
+    io.to(roomId).emit("winnersUpdated", room.winners);
+};
+
 const emitGameUpdated = (roomId, currentTurn = null) => {
     const room = rooms[roomId];
     if (!room) return;
@@ -113,7 +119,8 @@ const emitGameUpdated = (roomId, currentTurn = null) => {
         table: room.table,
         currentTurn,
         players: getPublicPlayers(room),
-        discardedCount: room.discardedPile.length
+        discardedCount: room.discardedPile.length,
+        winners: room.winners
     });
 };
 
@@ -134,6 +141,8 @@ const maybeFinishGame = (roomId) => {
         room.gameStarted = false;
         room.currentTurn = null;
 
+        emitWinnersUpdated(roomId);
+
         io.to(roomId).emit("gameFinished", {
             winners: room.winners
         });
@@ -146,23 +155,34 @@ const maybeFinishGame = (roomId) => {
 
 const updateWinners = (roomId) => {
     const room = rooms[roomId];
-    if (!room) return true;
+    if (!room) return { finished: true, addedWinners: [] };
+
+    const addedWinners = [];
 
     room.players.forEach(player => {
         const alreadyWinner = room.winners.some(w => w.id === player.id);
 
         if (player.hand.length === 0 && !alreadyWinner) {
-            room.winners.push({
+            const winnerObj = {
                 id: player.id,
                 name: player.name,
                 rank: room.winners.length + 1
-            });
+            };
+
+            room.winners.push(winnerObj);
+            addedWinners.push(winnerObj);
             console.log(`🏆 Winner added: ${player.name}`);
         }
     });
 
     emitPlayersUpdated(roomId);
-    return maybeFinishGame(roomId);
+
+    if (addedWinners.length > 0) {
+        emitWinnersUpdated(roomId);
+    }
+
+    const finished = maybeFinishGame(roomId);
+    return { finished, addedWinners };
 };
 
 const validateCardPlay = (room, player, card) => {
@@ -252,7 +272,6 @@ const chooseFollowCardAI = (room, bot) => {
 io.on("connection", (socket) => {
     console.log("Player Connected:", socket.id);
 
-    // 1. ரூம் உருவாக்குதல்
     socket.on("createRoom", ({ playerName }, callback) => {
         const roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
 
@@ -280,7 +299,6 @@ io.on("connection", (socket) => {
         callback(roomId);
     });
 
-    // 2. ரூமில் இணைதல்
     socket.on("joinRoom", ({ roomId, playerName }, callback) => {
         const room = rooms[roomId];
 
@@ -363,7 +381,6 @@ io.on("connection", (socket) => {
         });
     });
 
-    // 3. ஆட்டத்தைத் தொடங்குதல்
     socket.on("startGame", ({ roomId }) => {
         const room = rooms[roomId];
         if (!room) return;
@@ -407,8 +424,11 @@ io.on("connection", (socket) => {
 
         io.to(roomId).emit("gameStarted", {
             currentTurn: starterId,
-            players: getPublicPlayers(room)
+            players: getPublicPlayers(room),
+            winners: room.winners
         });
+
+        emitWinnersUpdated(roomId);
 
         if (starterId.startsWith('bot-')) checkBotTurn(roomId, starterId);
     });
@@ -451,9 +471,9 @@ io.on("connection", (socket) => {
             pushRecentLeadSuit(room, playedCard.symbol);
         }
 
-        updateWinners(roomId);
+        const { finished } = updateWinners(roomId);
 
-        if (!rooms[roomId]?.gameStarted) {
+        if (finished || !rooms[roomId]?.gameStarted) {
             room.table = [];
             room.currentTurn = null;
             emitGameUpdated(roomId, null);
@@ -491,15 +511,18 @@ io.on("connection", (socket) => {
                     table: liveRoom.table,
                     nextTurn: cutWinnerId,
                     updatedHand: cutWinner.hand,
-                    players: getPublicPlayers(liveRoom)
+                    players: getPublicPlayers(liveRoom),
+                    winners: liveRoom.winners
                 });
 
                 liveRoom.table = [];
 
-                const finished = updateWinners(roomId);
-                if (finished) return;
+                const result = updateWinners(roomId);
+                if (result.finished) return;
 
                 liveRoom.currentTurn = cutWinnerId;
+
+                emitWinnersUpdated(roomId);
 
                 if (cutWinnerId.startsWith('bot-')) {
                     checkBotTurn(roomId, cutWinnerId);
@@ -522,16 +545,19 @@ io.on("connection", (socket) => {
                     table: liveRoom.table,
                     nextTurn: roundWinnerId,
                     players: getPublicPlayers(liveRoom),
-                    discardedCount: liveRoom.discardedPile.length + liveRoom.table.length
+                    discardedCount: liveRoom.discardedPile.length + liveRoom.table.length,
+                    winners: liveRoom.winners
                 });
 
                 liveRoom.discardedPile.push(...liveRoom.table);
                 liveRoom.table = [];
 
-                const finished = updateWinners(roomId);
-                if (finished) return;
+                const result = updateWinners(roomId);
+                if (result.finished) return;
 
                 liveRoom.currentTurn = roundWinnerId;
+
+                emitWinnersUpdated(roomId);
 
                 if (roundWinnerId.startsWith('bot-')) {
                     checkBotTurn(roomId, roundWinnerId);
@@ -539,14 +565,18 @@ io.on("connection", (socket) => {
                     emitGameUpdated(roomId, roundWinnerId);
                 }
             } else {
-                const nextTurnId = getNextPlayer(roomId, playerId);
+                let nextTurnId = getNextPlayer(roomId, playerId);
 
                 if (!nextTurnId) {
-                    updateWinners(roomId);
+                    const result = updateWinners(roomId);
+                    if (!result.finished) {
+                        emitWinnersUpdated(roomId);
+                    }
                     return;
                 }
 
                 liveRoom.currentTurn = nextTurnId;
+                emitWinnersUpdated(roomId);
                 emitGameUpdated(roomId, nextTurnId);
 
                 if (nextTurnId.startsWith('bot-')) {
@@ -556,7 +586,6 @@ io.on("connection", (socket) => {
         }, 1200);
     }
 
-    // ✅ SAME AI STYLE AS GAME.JSX
     function checkBotTurn(roomId, botId) {
         const room = rooms[roomId];
         if (!room || !room.gameStarted) return;
