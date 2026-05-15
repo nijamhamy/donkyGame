@@ -12,12 +12,12 @@ const io = new Server(server, {
     transports: ['polling', 'websocket']
 });
 
-// --- 🃏 கார்டு கட்டு உருவாக்கம் (A to 2 Order) ---
 const createShuffledDeck = () => {
     const suits = ["Spades", "Hearts", "Clubs", "Diamonds"];
     const symbols = { "Spades": "♠", "Hearts": "♥", "Clubs": "♣", "Diamonds": "♦" };
     const ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"];
     let deck = [];
+
     suits.forEach(suit => {
         const cardColor = (suit === "Spades" || suit === "Clubs") ? "black" : "#e0115f";
         ranks.forEach((rank, index) => {
@@ -31,17 +31,334 @@ const createShuffledDeck = () => {
             });
         });
     });
+
     return deck.sort(() => Math.random() - 0.5);
 };
 
 let rooms = {};
 
+const sortHand = (hand) => {
+    const suitOrder = { 'Spades': 0, 'Hearts': 1, 'Clubs': 2, 'Diamonds': 3 };
+    return [...hand].sort((a, b) => {
+        if (suitOrder[a.name] !== suitOrder[b.name]) return suitOrder[a.name] - suitOrder[b.name];
+        return a.val - b.val;
+    });
+};
+
+const getRankLabel = (rank) => {
+    if (rank === 1) return '1st Winner';
+    if (rank === 2) return '2nd Winner';
+    if (rank === 3) return '3rd Winner';
+    if (rank === 4) return 'Donkey';
+    return 'Finished';
+};
+
+const publicPlayers = (room) => room.players.map(({ hand, ...rest }) => rest);
+
+const getAlivePlayers = (room) => {
+    return room.players.filter(p =>
+        p.hand.length > 0 &&
+        !room.winners.some(w => w.id === p.id)
+    );
+};
+
+const getHighestLeadPlayer = (table) => {
+    if (!table.length) return null;
+    const leadSuit = table[0].symbol;
+    const highest = table
+        .filter(c => c.symbol === leadSuit)
+        .sort((a, b) => b.val - a.val)[0];
+    return highest?.playedBy || null;
+};
+
+const getNextPlayer = (roomId, currentPlayerId) => {
+    const room = rooms[roomId];
+    if (!room || !room.players.length) return null;
+
+    const alivePlayers = getAlivePlayers(room);
+    if (alivePlayers.length === 0) return null;
+    if (alivePlayers.length === 1) return alivePlayers[0].id;
+
+    const playerIndex = room.players.findIndex(p => p.id === currentPlayerId);
+    if (playerIndex === -1) return alivePlayers[0].id;
+
+    for (let i = 1; i <= room.players.length; i++) {
+        const nextIdx = (playerIndex + i) % room.players.length;
+        const nextPlayer = room.players[nextIdx];
+        const isWinner = room.winners.some(w => w.id === nextPlayer.id);
+        const hasCards = (nextPlayer.hand?.length ?? 0) > 0;
+
+        if (nextPlayer && hasCards && !isWinner) return nextPlayer.id;
+    }
+
+    return alivePlayers[0]?.id || null;
+};
+
+const finalizeDonkeyIfNeeded = (room) => {
+    if (room.winners.length === 3) {
+        const donkey = room.players.find(p => !room.winners.some(w => w.id === p.id));
+        if (donkey) {
+            room.winners.push({
+                id: donkey.id,
+                name: donkey.name,
+                rank: 4,
+                label: getRankLabel(4)
+            });
+        }
+    }
+};
+
+const emitPlayersUpdated = (roomId) => {
+    const room = rooms[roomId];
+    if (!room) return;
+    io.to(roomId).emit("playersUpdated", publicPlayers(room));
+};
+
+const updateWinners = (roomId) => {
+    const room = rooms[roomId];
+    if (!room) return false;
+
+    room.players.forEach(player => {
+        const alreadyWinner = room.winners.some(w => w.id === player.id);
+        if (player.hand.length === 0 && !alreadyWinner) {
+            const rank = room.winners.length + 1;
+            room.winners.push({
+                id: player.id,
+                name: player.name,
+                rank,
+                label: getRankLabel(rank)
+            });
+        }
+    });
+
+    finalizeDonkeyIfNeeded(room);
+    emitPlayersUpdated(roomId);
+
+    if (room.winners.length >= 4 || room.winners.length >= 3) {
+        room.gameStarted = false;
+        io.to(roomId).emit("gameFinished", { winners: room.winners });
+        return true;
+    }
+
+    return false;
+};
+
+const emitGameState = (roomId, extra = {}) => {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    io.to(roomId).emit("gameUpdated", {
+        table: room.table,
+        currentTurn: room.currentTurn ?? null,
+        discardedCount: room.discardedPile.length,
+        winners: room.winners,
+        players: publicPlayers(room),
+        ...extra
+    });
+};
+
+const chooseBotCard = (room, botId) => {
+    const bot = room.players.find(p => p.id === botId);
+    if (!bot || !bot.hand.length) return null;
+
+    const recentLeadSuits = room.recentLeadSuits || [];
+    const playerIndex = room.players.findIndex(p => p.id === botId);
+    const nextPlayer = room.players[(playerIndex + 1) % room.players.length];
+    const nextMissing = room.missingCards[nextPlayer?.id] || [];
+
+    if (room.table.length === 0) {
+        const aceSpade = bot.hand.find(c => c.symbol === '♠' && c.label === 'A' && room.discardedPile.length === 0);
+        if (aceSpade) return aceSpade;
+
+        let bestCard = bot.hand[0];
+        let bestScore = -Infinity;
+
+        bot.hand.forEach(card => {
+            let score = 0;
+            score += (15 - card.val);
+
+            if (!nextMissing.includes(card.symbol)) score += 15;
+            else score -= 20;
+
+            const recentSpam = recentLeadSuits.filter(s => s === card.symbol).length;
+            score -= recentSpam * 8;
+
+            const sameSuitCount = bot.hand.filter(c => c.symbol === card.symbol).length;
+            score += sameSuitCount * 2;
+
+            if (card.val >= 13) score -= 10;
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestCard = card;
+            }
+        });
+
+        return bestCard;
+    }
+
+    const leadSuit = room.table[0].symbol;
+    const sameSuit = bot.hand.filter(c => c.symbol === leadSuit).sort((a, b) => a.val - b.val);
+
+    if (sameSuit.length > 0) {
+        const currentHigh = [...room.table]
+            .filter(c => c.symbol === leadSuit)
+            .sort((a, b) => b.val - a.val)[0];
+
+        return sameSuit.find(c => c.val > currentHigh.val) || sameSuit[0];
+    }
+
+    return [...bot.hand].sort((a, b) => b.val - a.val)[0];
+};
+
+const checkBotTurn = (roomId, botId) => {
+    const room = rooms[roomId];
+    if (!room || !room.gameStarted) return;
+
+    const bot = room.players.find(p => p.id === botId);
+    if (!bot || !bot.isBot) return;
+    if (room.winners.some(w => w.id === botId)) return;
+    if (room.currentTurn !== botId) return;
+    if (bot.hand.length <= 0) return;
+
+    setTimeout(() => {
+        const freshRoom = rooms[roomId];
+        if (!freshRoom || !freshRoom.gameStarted || freshRoom.currentTurn !== botId) return;
+
+        const cardToPlay = chooseBotCard(freshRoom, botId);
+        if (cardToPlay) handleMove(roomId, botId, cardToPlay);
+    }, 1200);
+};
+
+const handleMove = (roomId, playerId, card) => {
+    const room = rooms[roomId];
+    if (!room || !room.gameStarted) return;
+    if (room.currentTurn !== playerId) return;
+
+    const player = room.players.find(p => p.id === playerId);
+    if (!player) return;
+    if (room.winners.some(w => w.id === playerId)) return;
+
+    const cardExists = player.hand.find(c => c.id === card.id);
+    if (!cardExists) return;
+
+    const currentTable = [...room.table];
+    const leadSuit = currentTable[0]?.symbol || null;
+
+    if (leadSuit) {
+        const hasLeadSuit = player.hand.some(c => c.symbol === leadSuit);
+        if (hasLeadSuit && card.symbol !== leadSuit) return;
+    } else {
+        if (room.discardedPile.length === 0) {
+            const isAceSpades = card.symbol === '♠' && card.label === 'A';
+            if (!isAceSpades) return;
+        }
+        room.recentLeadSuits.push(card.symbol);
+        if (room.recentLeadSuits.length > 6) room.recentLeadSuits.shift();
+    }
+
+    player.hand = sortHand(player.hand.filter(c => c.id !== card.id));
+    player.handCount = player.hand.length;
+
+    const playedCard = { ...cardExists, playedBy: playerId };
+    room.table.push(playedCard);
+
+    if (!room.missingCards[playerId]) room.missingCards[playerId] = [];
+    if (leadSuit && playedCard.symbol !== leadSuit && !room.missingCards[playerId].includes(leadSuit)) {
+        room.missingCards[playerId].push(leadSuit);
+    }
+
+    if (!player.isBot) {
+        io.to(player.id).emit("yourCards", player.hand);
+    }
+
+    if (updateWinners(roomId)) return;
+
+    room.currentTurn = null;
+    emitGameState(roomId);
+
+    setTimeout(() => {
+        const freshRoom = rooms[roomId];
+        if (!freshRoom || !freshRoom.gameStarted || freshRoom.table.length === 0) return;
+
+        const fullTable = [...freshRoom.table];
+        const leadS = fullTable[0].symbol;
+        const justPlayed = fullTable[fullTable.length - 1];
+        const isCut = fullTable.length > 1 && justPlayed.symbol !== leadS;
+
+        if (isCut) {
+            const winnerId = getHighestLeadPlayer(fullTable);
+            const winnerPlayer = freshRoom.players.find(p => p.id === winnerId);
+            if (!winnerPlayer) return;
+
+            winnerPlayer.hand = sortHand([...winnerPlayer.hand, ...fullTable]);
+            winnerPlayer.handCount = winnerPlayer.hand.length;
+
+            const eventPayload = {
+                loser: justPlayed.playedBy,
+                table: fullTable,
+                nextTurn: winnerId,
+                updatedHand: winnerPlayer.id === playerId ? winnerPlayer.hand : winnerPlayer.hand,
+                discardedCount: freshRoom.discardedPile.length,
+                winners: freshRoom.winners,
+                players: publicPlayers(freshRoom)
+            };
+
+            if (!winnerPlayer.isBot) {
+                io.to(winnerPlayer.id).emit("yourCards", winnerPlayer.hand);
+            }
+
+            io.to(roomId).emit("strikeOccurred", eventPayload);
+
+            freshRoom.table = [];
+            freshRoom.currentTurn = winnerId;
+
+            if (updateWinners(roomId)) return;
+            if (winnerId.startsWith('bot-')) checkBotTurn(roomId, winnerId);
+            return;
+        }
+
+        const aliveNow = getAlivePlayers(freshRoom);
+        const roundPlayers = fullTable.map(c => c.playedBy);
+        const remainingEligible = aliveNow.filter(p => !roundPlayers.includes(p.id));
+
+        if (remainingEligible.length === 0) {
+            const winnerId = getHighestLeadPlayer(fullTable);
+            freshRoom.discardedPile.push(...fullTable);
+            freshRoom.table = [];
+            freshRoom.currentTurn = winnerId;
+
+            io.to(roomId).emit("roundComplete", {
+                winner: winnerId,
+                table: fullTable,
+                nextTurn: winnerId,
+                discardedCount: freshRoom.discardedPile.length,
+                winners: freshRoom.winners,
+                players: publicPlayers(freshRoom)
+            });
+
+            if (updateWinners(roomId)) return;
+            if (winnerId.startsWith('bot-')) checkBotTurn(roomId, winnerId);
+            return;
+        }
+
+        const nextTurnId = getNextPlayer(roomId, playerId);
+        freshRoom.currentTurn = nextTurnId;
+
+        emitGameState(roomId);
+
+        if (nextTurnId && nextTurnId.startsWith('bot-')) {
+            checkBotTurn(roomId, nextTurnId);
+        }
+    }, 1200);
+};
+
 io.on("connection", (socket) => {
     console.log("Player Connected:", socket.id);
 
-    // 1. ரூம் உருவாக்குதல்
     socket.on("createRoom", ({ playerName }, callback) => {
         const roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+
         rooms[roomId] = {
             players: [{
                 id: socket.id,
@@ -50,106 +367,64 @@ io.on("connection", (socket) => {
                 isBot: false,
                 hand: [],
                 handCount: 0,
-                isConnected: true // ஆன்லைன் ஸ்டேட்டஸ்
+                isConnected: true
             }],
             gameStarted: false,
+            currentTurn: null,
             table: [],
             winners: [],
             discardedPile: [],
-            missingCards: {}
+            missingCards: {},
+            recentLeadSuits: []
         };
+
         socket.join(roomId);
         callback(roomId);
+        emitPlayersUpdated(roomId);
     });
 
-    // 2. ரூமில் இணைதல்
     socket.on("joinRoom", ({ roomId, playerName }, callback) => {
-
         const room = rooms[roomId];
 
         if (!room) {
-            return callback({
-                success: false,
-                message: "Room not found!"
-            });
+            return callback({ success: false, message: "Room not found!" });
         }
 
         if (room.gameStarted) {
-            return callback({
-                success: false,
-                message: "Game already started!"
-            });
+            return callback({ success: false, message: "Game already started!" });
         }
 
-        // ✅ Check same socket already exists
-        const existingBySocket = room.players.find(
-            p => p.id === socket.id
-        );
-
+        const existingBySocket = room.players.find(p => p.id === socket.id);
         if (existingBySocket) {
-
             existingBySocket.isConnected = true;
-
             socket.join(roomId);
-
-            io.to(roomId).emit(
-                "playersUpdated",
-                room.players.map(({ hand, ...rest }) => rest)
-            );
-
-            return callback({
-                success: true,
-                rejoined: true
-            });
+            emitPlayersUpdated(roomId);
+            return callback({ success: true, rejoined: true });
         }
 
-        // ✅ Check same player name exists
         const existingByName = room.players.find(
-            p =>
-                !p.isBot &&
-                p.name.trim().toLowerCase() === playerName.trim().toLowerCase()
+            p => !p.isBot && p.name.trim().toLowerCase() === playerName.trim().toLowerCase()
         );
 
-        // ✅ RECONNECT LOGIC
         if (existingByName) {
-
-            console.log("Reconnecting player:", existingByName.name);
-
             existingByName.id = socket.id;
             existingByName.isConnected = true;
 
             socket.join(roomId);
+            emitPlayersUpdated(roomId);
 
-            io.to(roomId).emit(
-                "playersUpdated",
-                room.players.map(({ hand, ...rest }) => rest)
-            );
-
-            // restore cards if game already started
             if (existingByName.hand?.length > 0) {
-                io.to(socket.id).emit(
-                    "yourCards",
-                    existingByName.hand
-                );
+                io.to(socket.id).emit("yourCards", existingByName.hand);
             }
 
-            return callback({
-                success: true,
-                rejoined: true
-            });
+            return callback({ success: true, rejoined: true });
         }
 
-        // ✅ prevent room overflow
         const realPlayers = room.players.filter(p => !p.isBot);
-
         if (realPlayers.length >= 4) {
-            return callback({
-                success: false,
-                message: "Room full!"
-            });
+            return callback({ success: false, message: "Room full!" });
         }
 
-        // ✅ ADD NEW PLAYER
         room.players.push({
             id: socket.id,
             name: playerName.trim(),
@@ -161,27 +436,21 @@ io.on("connection", (socket) => {
         });
 
         socket.join(roomId);
-
-        io.to(roomId).emit(
-            "playersUpdated",
-            room.players.map(({ hand, ...rest }) => rest)
-        );
-
-        callback({
-            success: true
-        });
+        emitPlayersUpdated(roomId);
+        callback({ success: true });
     });
 
-    // 3. ஆட்டத்தைத் தொடங்குதல்
     socket.on("startGame", ({ roomId }) => {
         const room = rooms[roomId];
         if (!room) return;
 
         room.gameStarted = true;
+        room.currentTurn = null;
         room.table = [];
         room.winners = [];
         room.discardedPile = [];
         room.missingCards = {};
+        room.recentLeadSuits = [];
 
         while (room.players.length < 4) {
             const botId = `bot-${Math.random().toString(36).substr(2, 5)}`;
@@ -189,6 +458,7 @@ io.on("connection", (socket) => {
                 id: botId,
                 name: `Bot ${room.players.length}`,
                 isBot: true,
+                host: false,
                 hand: [],
                 handCount: 13,
                 isConnected: true
@@ -199,21 +469,22 @@ io.on("connection", (socket) => {
         let starterId = '';
 
         room.players.forEach((player, i) => {
-            player.hand = deck.slice(i * 13, (i + 1) * 13).sort((a, b) => b.val - a.val);
-            player.handCount = 13;
+            player.hand = sortHand(deck.slice(i * 13, (i + 1) * 13));
+            player.handCount = player.hand.length;
             if (player.hand.some(c => c.symbol === '♠' && c.label === 'A')) starterId = player.id;
             if (!player.isBot) io.to(player.id).emit("yourCards", player.hand);
         });
 
+        room.currentTurn = starterId;
+
         io.to(roomId).emit("gameStarted", {
             currentTurn: starterId,
-            players: room.players.map(({ hand, ...rest }) => rest)
+            players: publicPlayers(room)
         });
 
         if (starterId.startsWith('bot-')) checkBotTurn(roomId, starterId);
     });
 
-    // கார்டுகளை மீண்டும் கேட்கும் வசதி
     socket.on("requestMyCards", ({ roomId }) => {
         const room = rooms[roomId];
         if (room) {
@@ -228,311 +499,21 @@ io.on("connection", (socket) => {
         handleMove(roomId, socket.id, card);
     });
 
-    // Server.js - மல்டிபிளேயர் கேம் லாஜிக்
-
-    // Server.js - மல்டிபிளேயர் லாஜிக்
-
-    function getNextPlayer(roomId, currentPlayerId) {
-        const room = rooms[roomId];
-        if (!room || !room.players.length) return null;
-
-        const playerIndex = room.players.findIndex(p => p.id === currentPlayerId);
-        if (playerIndex === -1) return null;
-
-        for (let i = 1; i <= room.players.length; i++) {
-            const nextIdx = (playerIndex + i) % room.players.length;
-            const nextPlayer = room.players[nextIdx];
-
-            const isWinner = room.winners.some(w => w.id === nextPlayer.id);
-
-            // ✅ FIX: must check BOTH conditions properly
-            const hasCards = (nextPlayer.hand?.length ?? 0) > 0;
-
-            if (nextPlayer && hasCards && !isWinner) {
-                return nextPlayer.id;
-            }
-        }
-
-        return null;
-    }
-
-    function handleMove(roomId, playerId, card) {
-        const room = rooms[roomId];
-        if (!room || !room.gameStarted) return;
-
-        const player = room.players.find(p => p.id === playerId);
-        if (!player) return;
-
-        // 1. பிளேயர் கையில் இருந்து கார்டை நீக்குதல்
-        player.hand = player.hand.filter(c => c.id !== card.id);
-        player.handCount = player.hand.length;
-
-        updateWinners(roomId);
-
-
-        // stop game instantly if finished
-        if (!rooms[roomId]?.gameStarted) {
-            room.table = [];
-            io.to(roomId).emit("gameUpdated", {
-                table: [],
-                currentTurn: null,
-                players: room.players.map(({ hand, ...rest }) => rest)
-            });
-            return;
-        }
-
-        const playedCard = { ...card, playedBy: playerId };
-        room.table.push(playedCard);
-
-        // AI Memory: மிஸ்ஸிங் சூட் குறித்துக்கொள்ளுதல்
-        if (room.table.length > 1) {
-            const leadS = room.table[0].symbol;
-            if (playedCard.symbol !== leadS) {
-                if (!room.missingCards[playerId]) room.missingCards[playerId] = [];
-                if (!room.missingCards[playerId].includes(leadS)) {
-                    room.missingCards[playerId].push(leadS);
-                }
-            }
-        }
-
-        // போர்டை அப்டேட் செய்தல்
-        io.to(roomId).emit("gameUpdated", {
-            table: room.table,
-            currentTurn: null,
-            players: room.players.map(({ hand, ...rest }) => rest)
-        });
-
-        setTimeout(() => {
-            if (!room.table || room.table.length === 0) return;
-            const leadSuit = room.table[0].symbol;
-
-            // --- 🚨 STRIKE LOGIC (வெட்டுதல்) ---
-            if (playedCard.symbol !== leadSuit) {
-                const highestInLead = room.table
-                    .filter(c => c.symbol === leadSuit)
-                    .sort((a, b) => b.val - a.val)[0];
-
-                const loserId = highestInLead.playedBy;
-                const loserPlayer = room.players.find(p => p.id === loserId);
-
-                // மேஜையில் உள்ள அத்தனை கார்டுகளையும் எடுத்தல்
-                const cardsFromTable = [...room.table];
-                loserPlayer.hand = [...loserPlayer.hand, ...cardsFromTable];
-                loserPlayer.hand.sort((a, b) => {
-                    const suitOrder = {
-                        'Spades': 0,
-                        'Hearts': 1,
-                        'Diamonds': 2,
-                        'Clubs': 3
-                    };
-
-                    if (suitOrder[a.name] !== suitOrder[b.name]) {
-                        return suitOrder[a.name] - suitOrder[b.name];
-                    }
-
-                    return a.val - b.val;
-                });
-                loserPlayer.handCount = loserPlayer.hand.length;
-
-                io.to(roomId).emit("strikeOccurred", {
-                    loser: loserId,
-                    table: room.table,
-                    nextTurn: loserId,
-                    updatedHand: loserPlayer.hand, // ✅ important
-                    players: room.players.map(({ hand, ...rest }) => rest)
-                });
-
-                room.table = [];
-                updateWinners(roomId);
-
-                if (loserId.startsWith('bot-')) checkBotTurn(roomId, loserId);
-                return;
-            }
-
-            // --- ROUND COMPLETE (சுற்று முடிதல்) ---
-            const activePlayersNow = room.players.filter(p =>
-                p.hand.length > 0 &&
-                !room.winners.some(w => w.id === p.id)
-            ).length;
-
-            if (activePlayersNow === 0) return;
-
-            if (room.table.length === activePlayersNow) {
-                const highest = [...room.table]
-                    .sort((a, b) => b.val - a.val)[0];
-                const roundWinnerId = highest.playedBy;
-
-                io.to(roomId).emit("roundComplete", {
-                    winner: roundWinnerId,
-                    table: room.table,
-                    nextTurn: roundWinnerId,
-                    players: room.players.map(({ hand, ...rest }) => rest)
-                });
-
-                room.discardedPile.push(...room.table);
-                room.table = [];
-                updateWinners(roomId);
-
-                if (roundWinnerId.startsWith('bot-')) checkBotTurn(roomId, roundWinnerId);
-            } else {
-                // அடுத்த பிளேயர் டர்ன்
-                let nextTurnId = getNextPlayer(roomId, playerId);
-
-                if (!nextTurnId) {
-
-                    updateWinners(roomId);
-
-                    return;
-                }
-
-                io.to(roomId).emit("gameUpdated", {
-                    table: room.table,
-                    currentTurn: nextTurnId,
-                    players: room.players.map(({ hand, ...rest }) => rest)
-                });
-
-                if (nextTurnId && nextTurnId.startsWith('bot-')) checkBotTurn(roomId, nextTurnId);
-            }
-        }, 1200);
-    }
-
-    function updateWinners(roomId) {
-        const room = rooms[roomId];
-        if (!room) return;
-
-        room.players.forEach(player => {
-
-            const alreadyWinner = room.winners.some(w => w.id === player.id);
-
-            // ✅ FIX: use hand.length ONLY (handCount bug avoid)
-            if (player.hand.length === 0 && !alreadyWinner) {
-                room.winners.push({
-                    id: player.id,
-                    name: player.name,
-                    rank: room.winners.length + 1
-                });
-
-                console.log(`🏆 Winner added: ${player.name}`);
-            }
-        });
-
-        io.to(roomId).emit(
-            "playersUpdated",
-            room.players.map(({ hand, ...rest }) => rest)
-        );
-
-        // ✅ GAME END CHECK
-        const totalFinished = room.winners.length;
-
-        if (totalFinished >= 3) {
-
-            const donkey = room.players.find(
-                p => !room.winners.some(w => w.id === p.id)
-            );
-
-            if (donkey) {
-                room.winners.push({
-                    id: donkey.id,
-                    name: donkey.name,
-                    rank: 4
-                });
-            }
-
-            room.gameStarted = false;
-
-            io.to(roomId).emit("gameFinished", {
-                winners: room.winners
-            });
-        }
-    }
-
-    // 2. AI BOT TACTICAL LOGIC (பாதுகாப்பு விதிகள்)
-    function checkBotTurn(roomId, botId) {
-        const room = rooms[roomId];
-        if (!room || !room.gameStarted) return;
-        const bot = room.players.find(p => p.id === botId);
-        if (!bot || !bot.isBot || room.winners.some(w => w.id === botId)) return;
-
-        if (bot.hand.length <= 0 || room.winners.some(w => w.id === botId)) return;
-        setTimeout(() => {
-            let cardToPlay;
-            const turnOrder = room.players.map(p => p.id);
-            const nextPlayerId = turnOrder[(turnOrder.indexOf(botId) + 1) % 4];
-
-            if (room.table.length === 0) {
-                // HIGH-VALUE PROTECTION:
-                // அடுத்த பிளேயரிடம் எந்த சூட் இல்லை (Missing) என்பதைப் பார்த்து, 
-                // அந்த சூட்டில் உள்ள பெரிய கார்டுகளை (A, K) தற்காத்துக் கொள்ளும்.
-                const nextMissing = room.missingCards[nextPlayerId] || [];
-
-                // அடுத்த பிளேயரிடம் இருக்கும் என நம்பப்படும் "Safe" சூட்டைத் தேடுதல்
-                let safeCards = bot.hand.filter(c => !nextMissing.includes(c.symbol));
-
-                if (safeCards.length > 0) {
-                    // பாதுகாப்பான சூட்டில் சிறிய கார்டைப் போட்டு ஆட்டத்தைத் தொடங்கும்
-                    cardToPlay = safeCards.sort((a, b) => a.val - b.val)[0];
-                } else {
-                    // வேறு வழியில்லை என்றால் மிகச்சிறிய கார்டைப் போடும்
-                    cardToPlay = bot.hand.sort((a, b) => a.val - b.val)[0];
-                }
-
-                // ஆட்டத்தின் ஆரம்பம் எனில் Ace of Spades கட்டாயம்
-                const aceSpade = bot.hand.find(c => c.symbol === '♠' && c.label === 'A' && room.discardedPile.length === 0);
-                if (aceSpade) cardToPlay = aceSpade;
-
-            } else {
-                const leadSuit = room.table[0].symbol;
-                const sameSuit = bot.hand.filter(c => c.symbol === leadSuit).sort((a, b) => a.val - b.val);
-
-                if (sameSuit.length > 0) {
-                    const currentHigh = [...room.table].filter(c => c.symbol === leadSuit).sort((a, b) => b.val - a.val)[0];
-                    // தன்னிடம் வெல்லும் கார்டு (A/K) இருந்தால் அதைப் போட்டு தப்பிக்கும்
-                    cardToPlay = sameSuit.find(c => c.val > currentHigh.val) || sameSuit[0];
-                } else {
-                    // வெட்டுவதற்கு தன்னிடம் உள்ள மிகப்பெரிய கார்டைப் பயன்படுத்தும்
-                    cardToPlay = [...bot.hand]
-                        .sort((a, b) => a.val - b.val)[0];
-                }
-            }
-
-            if (cardToPlay) handleMove(roomId, botId, cardToPlay);
-        }, 1500);
-    }
-
-    // --- 🚨 NEW: CONNECTION TRACKING LOGIC ---
     socket.on("disconnect", () => {
-
         console.log("Disconnected:", socket.id);
 
         for (const roomId in rooms) {
-
             const room = rooms[roomId];
-
-            const player = room.players.find(
-                p => p.id === socket.id
-            );
+            const player = room.players.find(p => p.id === socket.id);
 
             if (!player) continue;
 
-            // ✅ mark offline only
             player.isConnected = false;
+            emitPlayersUpdated(roomId);
 
-            console.log(`${player.name} went offline`);
-
-            io.to(roomId).emit(
-                "playersUpdated",
-                room.players.map(({ hand, ...rest }) => rest)
-            );
-
-            // ✅ remove room if no humans online
-            const humansOnline = room.players.some(
-                p => !p.isBot && p.isConnected
-            );
+            const humansOnline = room.players.some(p => !p.isBot && p.isConnected);
 
             if (!humansOnline) {
-
-                console.log(`Deleting empty room ${roomId}`);
-
                 delete rooms[roomId];
             }
 
@@ -541,7 +522,6 @@ io.on("connection", (socket) => {
     });
 });
 
-// பழைய வரியை நீக்கிவிட்டு இதைச் சேர்க்கவும்
 const PORT = process.env.PORT || 3000;
 
 server.listen(PORT, '0.0.0.0', () => {
