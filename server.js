@@ -405,6 +405,8 @@ io.on("connection", (socket) => {
         const room = rooms[roomId];
         if (!room) return;
 
+        let changed = false;
+
         room.players.forEach(player => {
             const alreadyWinner = room.winners.some(w => w.id === player.id);
 
@@ -414,7 +416,7 @@ io.on("connection", (socket) => {
                     name: player.name,
                     rank: room.winners.length + 1
                 });
-
+                changed = true;
                 console.log(`🏆 Winner added: ${player.name}`);
             }
         });
@@ -424,6 +426,10 @@ io.on("connection", (socket) => {
             room.players.map(({ hand, ...rest }) => rest)
         );
 
+        if (changed) {
+            io.to(roomId).emit("winnersUpdated", room.winners);
+        }
+
         const totalFinished = room.winners.length;
 
         if (totalFinished >= 3) {
@@ -431,7 +437,7 @@ io.on("connection", (socket) => {
                 p => !room.winners.some(w => w.id === p.id)
             );
 
-            if (donkey) {
+            if (donkey && !room.winners.some(w => w.id === donkey.id)) {
                 room.winners.push({
                     id: donkey.id,
                     name: donkey.name,
@@ -441,6 +447,7 @@ io.on("connection", (socket) => {
 
             room.gameStarted = false;
 
+            io.to(roomId).emit("winnersUpdated", room.winners);
             io.to(roomId).emit("gameFinished", {
                 winners: room.winners
             });
