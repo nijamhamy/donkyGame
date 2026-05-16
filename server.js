@@ -74,7 +74,7 @@ io.on("connection", (socket) => {
             discardedPile: [],
             missingCards: {},
             recentLeadSuits: [],
-            safePlayerId: null,
+            loadedPlayerId: null,
             lastRoundType: null
         };
         socket.join(roomId);
@@ -99,9 +99,7 @@ io.on("connection", (socket) => {
             });
         }
 
-        const existingBySocket = room.players.find(
-            p => p.id === socket.id
-        );
+        const existingBySocket = room.players.find(p => p.id === socket.id);
 
         if (existingBySocket) {
             existingBySocket.isConnected = true;
@@ -138,10 +136,7 @@ io.on("connection", (socket) => {
             );
 
             if (existingByName.hand?.length > 0) {
-                io.to(socket.id).emit(
-                    "yourCards",
-                    existingByName.hand
-                );
+                io.to(socket.id).emit("yourCards", existingByName.hand);
             }
 
             return callback({
@@ -192,7 +187,7 @@ io.on("connection", (socket) => {
         room.discardedPile = [];
         room.missingCards = {};
         room.recentLeadSuits = [];
-        room.safePlayerId = null;
+        room.loadedPlayerId = null;
         room.lastRoundType = null;
 
         while (room.players.length < 4) {
@@ -225,6 +220,7 @@ io.on("connection", (socket) => {
         if (starterId.startsWith('bot-')) checkBotTurn(roomId, starterId);
     });
 
+    // கார்டுகளை மீண்டும் கேட்கும் வசதி
     socket.on("requestMyCards", ({ roomId }) => {
         const room = rooms[roomId];
         if (room) {
@@ -267,11 +263,17 @@ io.on("connection", (socket) => {
         }
     }
 
-    function pushRecentLeadSuit(room, suit) {
-        room.recentLeadSuits.push(suit);
+    function pushRecentLeadSuit(room, suitSymbol) {
+        room.recentLeadSuits.push(suitSymbol);
         if (room.recentLeadSuits.length > 8) {
             room.recentLeadSuits.shift();
         }
+    }
+
+    function getHighestLeadCard(cards, leadSuit) {
+        return [...cards]
+            .filter(c => c.symbol === leadSuit)
+            .sort((a, b) => b.val - a.val)[0];
     }
 
     function handleMove(roomId, playerId, card) {
@@ -281,11 +283,13 @@ io.on("connection", (socket) => {
         const player = room.players.find(p => p.id === playerId);
         if (!player) return;
 
+        // 1. பிளேயர் கையில் இருந்து கார்டை நீக்குதல்
         player.hand = player.hand.filter(c => c.id !== card.id);
         player.handCount = player.hand.length;
 
         updateWinners(roomId);
 
+        // stop game instantly if finished
         if (!rooms[roomId]?.gameStarted) {
             room.table = [];
             io.to(roomId).emit("gameUpdated", {
@@ -303,6 +307,7 @@ io.on("connection", (socket) => {
             pushRecentLeadSuit(room, playedCard.symbol);
         }
 
+        // AI Memory: மிஸ்ஸிங் சூட் குறித்துக்கொள்ளுதல்
         if (room.table.length > 1) {
             const leadS = room.table[0].symbol;
             if (playedCard.symbol !== leadS) {
@@ -310,6 +315,7 @@ io.on("connection", (socket) => {
             }
         }
 
+        // போர்டை அப்டேட் செய்தல்
         io.to(roomId).emit("gameUpdated", {
             table: room.table,
             currentTurn: null,
@@ -318,32 +324,35 @@ io.on("connection", (socket) => {
 
         setTimeout(() => {
             if (!room.table || room.table.length === 0) return;
+
             const leadSuit = room.table[0].symbol;
+            const latestCard = room.table[room.table.length - 1];
 
             // --- 🚨 STRIKE LOGIC (வெட்டுதல்) ---
-            if (playedCard.symbol !== leadSuit) {
-                const loserId = room.table[room.table.length - 1].playedBy;
-                const loserPlayer = room.players.find(p => p.id === loserId);
+            if (room.table.length > 1 && latestCard.symbol !== leadSuit) {
+                const highestInLead = getHighestLeadCard(room.table, leadSuit);
+                const loadedPlayerId = highestInLead.playedBy;
+                const loadedPlayer = room.players.find(p => p.id === loadedPlayerId);
 
                 const cardsFromTable = [...room.table];
-                loserPlayer.hand = sortHandBySuitAndValue([...loserPlayer.hand, ...cardsFromTable]);
-                loserPlayer.handCount = loserPlayer.hand.length;
+                loadedPlayer.hand = sortHandBySuitAndValue([...loadedPlayer.hand, ...cardsFromTable]);
+                loadedPlayer.handCount = loadedPlayer.hand.length;
 
-                room.safePlayerId = loserId;
+                room.loadedPlayerId = loadedPlayerId;
                 room.lastRoundType = 'cut';
 
                 io.to(roomId).emit("strikeOccurred", {
-                    loser: loserId,
+                    loser: loadedPlayerId,
                     table: room.table,
-                    nextTurn: loserId,
-                    updatedHand: loserPlayer.hand,
+                    nextTurn: loadedPlayerId,
+                    updatedHand: loadedPlayer.hand,
                     players: room.players.map(({ hand, ...rest }) => rest)
                 });
 
                 room.table = [];
                 updateWinners(roomId);
 
-                if (loserId.startsWith('bot-')) checkBotTurn(roomId, loserId);
+                if (loadedPlayerId.startsWith('bot-')) checkBotTurn(roomId, loadedPlayerId);
                 return;
             }
 
@@ -356,9 +365,8 @@ io.on("connection", (socket) => {
             if (activePlayersNow === 0) return;
 
             if (room.table.length === activePlayersNow) {
-                const leadCards = room.table.filter(c => c.symbol === leadSuit);
-                const highest = [...leadCards].sort((a, b) => b.val - a.val)[0];
-                const roundWinnerId = highest.playedBy;
+                const highestLead = getHighestLeadCard(room.table, leadSuit);
+                const roundWinnerId = highestLead.playedBy;
 
                 io.to(roomId).emit("roundComplete", {
                     winner: roundWinnerId,
@@ -369,7 +377,7 @@ io.on("connection", (socket) => {
 
                 room.discardedPile.push(...room.table);
                 room.table = [];
-                room.safePlayerId = null;
+                room.loadedPlayerId = null;
                 room.lastRoundType = 'normal';
                 updateWinners(roomId);
 
@@ -451,15 +459,15 @@ io.on("connection", (socket) => {
             let cardToPlay;
             const turnOrder = room.players.map(p => p.id);
             const nextPlayerId = turnOrder[(turnOrder.indexOf(botId) + 1) % 4];
+            const nextMissing = room.missingCards[nextPlayerId] || [];
+            const recentLeads = room.recentLeadSuits.slice(-4);
 
             if (room.table.length === 0) {
-                const nextMissing = room.missingCards[nextPlayerId] || [];
-                const recentLeads = room.recentLeadSuits.slice(-4);
-
                 const aceSpade = bot.hand.find(c => c.symbol === '♠' && c.label === 'A' && room.discardedPile.length === 0);
+
                 if (aceSpade) {
                     cardToPlay = aceSpade;
-                } else if (room.safePlayerId === botId && room.lastRoundType === 'cut') {
+                } else if (room.loadedPlayerId === botId && room.lastRoundType === 'cut') {
                     let bestCard = null;
                     let bestScore = -Infinity;
 
@@ -491,7 +499,7 @@ io.on("connection", (socket) => {
                     bot.hand.forEach(card => {
                         let score = 0;
 
-                        if (!nextMissing.includes(card.symbol)) score += 20;
+                        if (!nextMissing.includes(card.symbol)) score += 18;
                         else score -= 18;
 
                         score -= card.val * 0.35;
@@ -502,7 +510,7 @@ io.on("connection", (socket) => {
                         const sameSuitCount = bot.hand.filter(c => c.symbol === card.symbol).length;
                         if (sameSuitCount >= 3) score += 5;
 
-                        if (card.val >= 13 && nextMissing.includes(card.symbol)) score -= 12;
+                        if (card.val >= 13 && nextMissing.includes(card.symbol)) score -= 10;
                         if (card.val <= 5) score += 8;
 
                         if (score > bestScore) {
@@ -522,7 +530,7 @@ io.on("connection", (socket) => {
                         .filter(c => c.symbol === leadSuit)
                         .sort((a, b) => b.val - a.val)[0];
 
-                    if (room.safePlayerId === botId && room.lastRoundType === 'cut') {
+                    if (room.loadedPlayerId === botId && room.lastRoundType === 'cut') {
                         cardToPlay = sameSuit[0];
                     } else {
                         cardToPlay = sameSuit.find(c => c.val > currentHigh.val) || sameSuit[0];
@@ -530,6 +538,7 @@ io.on("connection", (socket) => {
                 } else {
                     rememberMissingSuit(room, botId, leadSuit);
 
+                    // When cutting, use a high-value card to put danger on lead player
                     cardToPlay = [...bot.hand].sort((a, b) => b.val - a.val)[0];
                 }
             }
