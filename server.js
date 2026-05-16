@@ -12,6 +12,7 @@ const io = new Server(server, {
     transports: ['polling', 'websocket']
 });
 
+// --- 🃏 Deck ---
 const createShuffledDeck = () => {
     const suits = ["Spades", "Hearts", "Clubs", "Diamonds"];
     const symbols = { "Spades": "♠", "Hearts": "♥", "Clubs": "♣", "Diamonds": "♦" };
@@ -229,10 +230,7 @@ const chooseLeadCardAI = (room, bot) => {
     const suitGroups = groupBySuit(bot.hand);
     Object.values(suitGroups).forEach(cards => cards.sort((a, b) => a.val - b.val));
 
-    // 🔥 Danger protection:
-    // If this bot just won by cut and took many cards, protect by leading a small card
-    // in a suit the next player is likely to still have.
-    if (room.dangerPlayerId === bot.id && room.lastRoundType === 'cut') {
+    if (room.safePlayerId === bot.id && room.lastRoundType === 'cut') {
         let safestCandidate = null;
         let safestScore = -Infinity;
 
@@ -301,14 +299,11 @@ const chooseFollowCardAI = (room, bot) => {
             .filter(c => c.symbol === leadSuit)
             .sort((a, b) => b.val - a.val)[0];
 
-        const winningCard = sameSuitCards.find(c => c.val > currentHigh.val);
-
-        // If bot is in danger mode, protect by using smallest valid same-suit card when possible
-        if (room.dangerPlayerId === bot.id && room.lastRoundType === 'cut') {
+        if (room.safePlayerId === bot.id && room.lastRoundType === 'cut') {
             return sameSuitCards[0];
         }
 
-        return winningCard || sameSuitCards[0];
+        return sameSuitCards.find(c => c.val > currentHigh.val) || sameSuitCards[0];
     }
 
     rememberMissingSuit(room, bot.id, leadSuit);
@@ -341,7 +336,7 @@ io.on("connection", (socket) => {
             discardedPile: [],
             missingCards: {},
             recentLeadSuits: [],
-            dangerPlayerId: null,
+            safePlayerId: null,
             lastRoundType: null
         };
 
@@ -442,7 +437,7 @@ io.on("connection", (socket) => {
         room.discardedPile = [];
         room.missingCards = {};
         room.recentLeadSuits = [];
-        room.dangerPlayerId = null;
+        room.safePlayerId = null;
         room.lastRoundType = null;
 
         while (room.players.length < 4) {
@@ -547,22 +542,20 @@ io.on("connection", (socket) => {
             if (isCut) {
                 rememberMissingSuit(liveRoom, latestCard.playedBy, leadSuit);
 
-                const cutSuit = latestCard.symbol;
-                const highestCut = getHighestCardOfSuit(liveRoom.table, cutSuit);
-                const cutWinnerId = highestCut.playedBy;
+                // IMPORTANT: cutter is the winner in your rule
+                const cutWinnerId = latestCard.playedBy;
                 const cutWinner = liveRoom.players.find(p => p.id === cutWinnerId);
-
                 if (!cutWinner) return;
 
                 const tableCards = [...liveRoom.table];
                 cutWinner.hand = sortHand([...cutWinner.hand, ...tableCards]);
                 cutWinner.handCount = cutWinner.hand.length;
 
-                liveRoom.dangerPlayerId = cutWinnerId;
+                liveRoom.safePlayerId = cutWinnerId;
                 liveRoom.lastRoundType = 'cut';
 
                 io.to(roomId).emit("strikeOccurred", {
-                    loser: cutWinnerId,
+                    winner: cutWinnerId,
                     table: liveRoom.table,
                     nextTurn: cutWinnerId,
                     updatedHand: cutWinner.hand,
@@ -578,7 +571,7 @@ io.on("connection", (socket) => {
                 liveRoom.currentTurn = cutWinnerId;
                 emitWinnersUpdated(roomId);
 
-                if (cutWinnerId.startsWith('bot-')) {
+                if (cutWinner.isBot) {
                     checkBotTurn(roomId, cutWinnerId);
                 } else {
                     emitGameUpdated(roomId, cutWinnerId);
@@ -605,7 +598,7 @@ io.on("connection", (socket) => {
 
                 liveRoom.discardedPile.push(...liveRoom.table);
                 liveRoom.table = [];
-                liveRoom.dangerPlayerId = null;
+                liveRoom.safePlayerId = null;
                 liveRoom.lastRoundType = 'normal';
 
                 const result = updateWinners(roomId);
