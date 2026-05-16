@@ -18,6 +18,7 @@ const createShuffledDeck = () => {
     const symbols = { "Spades": "♠", "Hearts": "♥", "Clubs": "♣", "Diamonds": "♦" };
     const ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"];
     let deck = [];
+
     suits.forEach(suit => {
         const cardColor = (suit === "Spades" || suit === "Clubs") ? "black" : "#e0115f";
         ranks.forEach((rank, index) => {
@@ -31,6 +32,7 @@ const createShuffledDeck = () => {
             });
         });
     });
+
     return deck.sort(() => Math.random() - 0.5);
 };
 
@@ -58,6 +60,7 @@ io.on("connection", (socket) => {
     // 1. ரூம் உருவாக்குதல்
     socket.on("createRoom", ({ playerName }, callback) => {
         const roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
+
         rooms[roomId] = {
             players: [{
                 id: socket.id,
@@ -77,6 +80,7 @@ io.on("connection", (socket) => {
             loadedPlayerId: null,
             lastRoundType: null
         };
+
         socket.join(roomId);
         callback(roomId);
     });
@@ -172,6 +176,109 @@ io.on("connection", (socket) => {
         );
 
         callback({
+            success: true
+        });
+    });
+
+    // NEW: room state request
+    socket.on("requestRoomState", ({ roomId }) => {
+        const room = rooms[roomId];
+        if (!room) return;
+
+        io.to(roomId).emit("roomState", {
+            roomId,
+            players: room.players.map(({ hand, ...rest }) => rest)
+        });
+    });
+
+    // NEW: return all players to lobby
+    socket.on("returnToLobby", ({ roomId }) => {
+        const room = rooms[roomId];
+        if (!room) return;
+
+        room.gameStarted = false;
+        room.table = [];
+        room.winners = [];
+        room.discardedPile = [];
+        room.missingCards = {};
+        room.recentLeadSuits = [];
+        room.loadedPlayerId = null;
+        room.lastRoundType = null;
+
+        room.players = room.players
+            .filter(player => !player.isBot)
+            .map((player, index) => ({
+                ...player,
+                host: index === 0 ? true : player.host,
+                hand: [],
+                handCount: 0,
+                isConnected: player.isConnected !== false
+            }));
+
+        io.to(roomId).emit(
+            "playersUpdated",
+            room.players.map(({ hand, ...rest }) => rest)
+        );
+
+        io.to(roomId).emit("roomState", {
+            roomId,
+            players: room.players.map(({ hand, ...rest }) => rest)
+        });
+    });
+
+    // NEW: host remove player
+    socket.on("removePlayer", ({ roomId, targetPlayerId }, callback) => {
+        const room = rooms[roomId];
+
+        if (!room) {
+            return callback?.({
+                success: false,
+                message: "Room not found"
+            });
+        }
+
+        const requester = room.players.find(p => p.id === socket.id);
+
+        if (!requester || !requester.host) {
+            return callback?.({
+                success: false,
+                message: "Only host can remove players"
+            });
+        }
+
+        if (targetPlayerId === socket.id) {
+            return callback?.({
+                success: false,
+                message: "Host cannot remove self"
+            });
+        }
+
+        const targetPlayer = room.players.find(p => p.id === targetPlayerId);
+
+        if (!targetPlayer) {
+            return callback?.({
+                success: false,
+                message: "Player not found"
+            });
+        }
+
+        room.players = room.players.filter(p => p.id !== targetPlayerId);
+
+        io.to(targetPlayerId).emit("removedFromRoom", {
+            message: "You were removed from the room"
+        });
+
+        io.to(roomId).emit(
+            "playersUpdated",
+            room.players.map(({ hand, ...rest }) => rest)
+        );
+
+        io.to(roomId).emit("roomState", {
+            roomId,
+            players: room.players.map(({ hand, ...rest }) => rest)
+        });
+
+        callback?.({
             success: true
         });
     });
@@ -283,13 +390,11 @@ io.on("connection", (socket) => {
         const player = room.players.find(p => p.id === playerId);
         if (!player) return;
 
-        // 1. பிளேயர் கையில் இருந்து கார்டை நீக்குதல்
         player.hand = player.hand.filter(c => c.id !== card.id);
         player.handCount = player.hand.length;
 
         updateWinners(roomId);
 
-        // stop game instantly if finished
         if (!rooms[roomId]?.gameStarted) {
             room.table = [];
             io.to(roomId).emit("gameUpdated", {
@@ -307,7 +412,6 @@ io.on("connection", (socket) => {
             pushRecentLeadSuit(room, playedCard.symbol);
         }
 
-        // AI Memory: மிஸ்ஸிங் சூட் குறித்துக்கொள்ளுதல்
         if (room.table.length > 1) {
             const leadS = room.table[0].symbol;
             if (playedCard.symbol !== leadS) {
@@ -315,7 +419,6 @@ io.on("connection", (socket) => {
             }
         }
 
-        // போர்டை அப்டேட் செய்தல்
         io.to(roomId).emit("gameUpdated", {
             table: room.table,
             currentTurn: null,
@@ -328,7 +431,6 @@ io.on("connection", (socket) => {
             const leadSuit = room.table[0].symbol;
             const latestCard = room.table[room.table.length - 1];
 
-            // --- 🚨 STRIKE LOGIC (வெட்டுதல்) ---
             if (room.table.length > 1 && latestCard.symbol !== leadSuit) {
                 const highestInLead = getHighestLeadCard(room.table, leadSuit);
                 const loadedPlayerId = highestInLead.playedBy;
@@ -356,7 +458,6 @@ io.on("connection", (socket) => {
                 return;
             }
 
-            // --- ROUND COMPLETE (சுற்று முடிதல்) ---
             const activePlayersNow = room.players.filter(p =>
                 p.hand.length > 0 &&
                 !room.winners.some(w => w.id === p.id)
@@ -449,7 +550,8 @@ io.on("connection", (socket) => {
 
             io.to(roomId).emit("winnersUpdated", room.winners);
             io.to(roomId).emit("gameFinished", {
-                winners: room.winners
+                winners: room.winners,
+                players: room.players.map(({ hand, ...rest }) => rest)
             });
         }
     }
@@ -544,8 +646,6 @@ io.on("connection", (socket) => {
                     }
                 } else {
                     rememberMissingSuit(room, botId, leadSuit);
-
-                    // When cutting, use a high-value card to put danger on lead player
                     cardToPlay = [...bot.hand].sort((a, b) => b.val - a.val)[0];
                 }
             }
