@@ -12,7 +12,6 @@ const io = new Server(server, {
     transports: ['polling', 'websocket']
 });
 
-// --- 🃏 கார்டு கட்டு உருவாக்கம் (A to 2 Order) ---
 const createShuffledDeck = () => {
     const suits = ["Spades", "Hearts", "Clubs", "Diamonds"];
     const symbols = { "Spades": "♠", "Hearts": "♥", "Clubs": "♣", "Diamonds": "♦" };
@@ -209,6 +208,14 @@ const validateCardPlay = (room, player, card) => {
     return true;
 };
 
+const groupBySuit = (hand) => {
+    return hand.reduce((acc, card) => {
+        if (!acc[card.symbol]) acc[card.symbol] = [];
+        acc[card.symbol].push(card);
+        return acc;
+    }, {});
+};
+
 const chooseLeadCardAI = (room, bot) => {
     const nextPlayerId = getNextPlayer(room.id, bot.id);
     const nextMissing = nextPlayerId ? (room.missingCards[nextPlayerId] || []) : [];
@@ -218,6 +225,40 @@ const chooseLeadCardAI = (room, bot) => {
         c => c.symbol === '♠' && c.label === 'A' && room.discardedPile.length === 0
     );
     if (aceSpade) return aceSpade;
+
+    const suitGroups = groupBySuit(bot.hand);
+    Object.values(suitGroups).forEach(cards => cards.sort((a, b) => a.val - b.val));
+
+    // 🔥 Danger protection:
+    // If this bot just won by cut and took many cards, protect by leading a small card
+    // in a suit the next player is likely to still have.
+    if (room.dangerPlayerId === bot.id && room.lastRoundType === 'cut') {
+        let safestCandidate = null;
+        let safestScore = -Infinity;
+
+        Object.entries(suitGroups).forEach(([suit, cards]) => {
+            const smallest = cards[0];
+            let score = 0;
+
+            const nextPlayerLikelyHasSuit = !nextMissing.includes(suit);
+            if (nextPlayerLikelyHasSuit) score += 30;
+            else score -= 25;
+
+            const suitSpamPenalty = recentLeads.filter(s => s === suit).length * 5;
+            score -= suitSpamPenalty;
+
+            score -= smallest.val * 2;
+
+            if (cards.length >= 2) score += 4;
+
+            if (score > safestScore) {
+                safestScore = score;
+                safestCandidate = smallest;
+            }
+        });
+
+        if (safestCandidate) return safestCandidate;
+    }
 
     let bestCard = bot.hand[0];
     let bestScore = -Infinity;
@@ -260,7 +301,14 @@ const chooseFollowCardAI = (room, bot) => {
             .filter(c => c.symbol === leadSuit)
             .sort((a, b) => b.val - a.val)[0];
 
-        return sameSuitCards.find(c => c.val > currentHigh.val) || sameSuitCards[0];
+        const winningCard = sameSuitCards.find(c => c.val > currentHigh.val);
+
+        // If bot is in danger mode, protect by using smallest valid same-suit card when possible
+        if (room.dangerPlayerId === bot.id && room.lastRoundType === 'cut') {
+            return sameSuitCards[0];
+        }
+
+        return winningCard || sameSuitCards[0];
     }
 
     rememberMissingSuit(room, bot.id, leadSuit);
@@ -292,7 +340,9 @@ io.on("connection", (socket) => {
             winners: [],
             discardedPile: [],
             missingCards: {},
-            recentLeadSuits: []
+            recentLeadSuits: [],
+            dangerPlayerId: null,
+            lastRoundType: null
         };
 
         socket.join(roomId);
@@ -392,6 +442,8 @@ io.on("connection", (socket) => {
         room.discardedPile = [];
         room.missingCards = {};
         room.recentLeadSuits = [];
+        room.dangerPlayerId = null;
+        room.lastRoundType = null;
 
         while (room.players.length < 4) {
             const botId = `bot-${Math.random().toString(36).substr(2, 5)}`;
@@ -506,6 +558,9 @@ io.on("connection", (socket) => {
                 cutWinner.hand = sortHand([...cutWinner.hand, ...tableCards]);
                 cutWinner.handCount = cutWinner.hand.length;
 
+                liveRoom.dangerPlayerId = cutWinnerId;
+                liveRoom.lastRoundType = 'cut';
+
                 io.to(roomId).emit("strikeOccurred", {
                     loser: cutWinnerId,
                     table: liveRoom.table,
@@ -521,7 +576,6 @@ io.on("connection", (socket) => {
                 if (result.finished) return;
 
                 liveRoom.currentTurn = cutWinnerId;
-
                 emitWinnersUpdated(roomId);
 
                 if (cutWinnerId.startsWith('bot-')) {
@@ -551,12 +605,13 @@ io.on("connection", (socket) => {
 
                 liveRoom.discardedPile.push(...liveRoom.table);
                 liveRoom.table = [];
+                liveRoom.dangerPlayerId = null;
+                liveRoom.lastRoundType = 'normal';
 
                 const result = updateWinners(roomId);
                 if (result.finished) return;
 
                 liveRoom.currentTurn = roundWinnerId;
-
                 emitWinnersUpdated(roomId);
 
                 if (roundWinnerId.startsWith('bot-')) {
@@ -569,9 +624,7 @@ io.on("connection", (socket) => {
 
                 if (!nextTurnId) {
                     const result = updateWinners(roomId);
-                    if (!result.finished) {
-                        emitWinnersUpdated(roomId);
-                    }
+                    if (!result.finished) emitWinnersUpdated(roomId);
                     return;
                 }
 
