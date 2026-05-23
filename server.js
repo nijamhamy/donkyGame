@@ -1,4 +1,3 @@
-
 import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
@@ -96,7 +95,6 @@ function pushRecentLeadSuit(room, suitSymbol) {
     if (room.recentLeadSuits.length > 6) room.recentLeadSuits.shift();
 }
 
-// Register winners for players with empty hands; return true if game should end
 function updateWinners(roomId) {
     const room = rooms[roomId];
     if (!room) return false;
@@ -128,7 +126,7 @@ function endGame(roomId) {
     if (!room || room.gameEnded) return;
     room.gameEnded = true;
     room.gameStarted = false;
-    // Ensure donkey is assigned
+    room.currentTurn = null;
     if (room.winners.length < 4) {
         const remaining = room.players.find(p => !room.winners.some(w => w.id === p.id));
         if (remaining) room.winners.push({ id: remaining.id, name: remaining.name, rank: 4, label: 'Oops! Donkey' });
@@ -141,7 +139,7 @@ function endGame(roomId) {
 }
 
 // ─────────────────────────────────────────────
-// MASTERMIND AI (exact port of Game.jsx)
+// MASTERMIND AI
 // ─────────────────────────────────────────────
 function chooseLeadCardAI(room, botId) {
     const bot = room.players.find(p => p.id === botId);
@@ -204,7 +202,6 @@ function chooseFollowCardAI(room, botId) {
         const winningCards = sameSuitCards.filter(c => c.val > currentHighVal);
         const losingCards = sameSuitCards.filter(c => c.val <= currentHighVal);
 
-        // Detect future void players
         const roundPlayedBy = new Set(room.table.map(c => c.playedBy));
         const remainingAlive = room.players.filter(p =>
             !roundPlayedBy.has(p.id) &&
@@ -220,40 +217,36 @@ function chooseFollowCardAI(room, botId) {
         const trickIsRisky = futureVoidCount > 0 || dangerAlreadyOnTable > 0;
 
         if (trickIsRisky) {
-            // Try to lose intentionally — play highest card that still loses
             if (losingCards.length > 0) return losingCards[losingCards.length - 1];
-            // Forced to win — play smallest winner
             if (winningCards.length > 0) return winningCards[0];
-            // Fallback: smallest card
             return sameSuitCards[0];
         }
 
-        // Safe trick — win cheaply
         if (winningCards.length > 0) return winningCards[0];
-        // Can't win — save high cards
         return sameSuitCards[0];
     }
 
-    // Void — dump highest value card (get rid of danger)
     rememberMissingSuit(room, botId, leadSuit);
     return [...aiHand].sort((a, b) => b.val - a.val)[0];
 }
 
 // ─────────────────────────────────────────────
-// BOT SCHEDULER
-// FIX: removed the r.currentTurn !== botId guard that was
-// causing bots to silently skip turns when currentTurn was
-// updated asynchronously inside setTimeout.
-// Instead we just re-validate at execution time.
+// BOT SCHEDULER — token lock prevents duplicate/stale fires
 // ─────────────────────────────────────────────
 function scheduleBotTurn(roomId, botId, delay = 1000) {
+    if (!rooms[roomId]) return;
+
+    // Each new schedule stamps a unique token — only the latest fires
+    if (!rooms[roomId]._botToken) rooms[roomId]._botToken = {};
+    const token = Date.now() + Math.random();
+    rooms[roomId]._botToken[botId] = token;
+
     setTimeout(() => {
         const r = rooms[roomId];
-        if (!r || !r.gameStarted) return;
-        if (r.gameEnded) return;
-
-        // Re-check at execution time (not at schedule time)
+        if (!r || !r.gameStarted || r.gameEnded) return;
         if (r.currentTurn !== botId) return;
+        // Stale call guard — discard if a newer schedule replaced this one
+        if (r._botToken[botId] !== token) return;
 
         const b = r.players.find(p => p.id === botId);
         if (!b || !b.isBot || !b.hand || b.hand.length === 0) return;
@@ -268,13 +261,12 @@ function scheduleBotTurn(roomId, botId, delay = 1000) {
             }
         } catch (e) {
             console.error('AI choose error:', e);
-            cardToPlay = b.hand[0]; // safe fallback
+            cardToPlay = b.hand[0];
         }
 
         if (cardToPlay) {
             handleMove(roomId, botId, cardToPlay);
         } else {
-            // Emergency fallback — play first card
             if (b.hand.length > 0) handleMove(roomId, botId, b.hand[0]);
         }
     }, delay);
@@ -294,14 +286,13 @@ function handleMove(roomId, playerId, card) {
 
     const cardInHand = player.hand.find(c => c.id === card.id);
     if (!cardInHand) {
-        // Emergency: bot has stale card reference — play any card
         if (player.isBot && player.hand.length > 0) {
             return handleMove(roomId, playerId, player.hand[0]);
         }
         return;
     }
 
-    // Remove card
+    // Remove card from hand
     player.hand = player.hand.filter(c => c.id !== card.id);
     player.handCount = player.hand.length;
 
@@ -320,16 +311,6 @@ function handleMove(roomId, playerId, card) {
         }
     }
 
-    // Clear current turn so no double moves happen while in setTimeout
-    room.currentTurn = null;
-
-    // Broadcast table update immediately
-    io.to(roomId).emit('gameUpdated', {
-        table: room.table,
-        currentTurn: null,
-        players: room.players.map(({ hand, ...rest }) => rest)
-    });
-
     // Send updated hand to human player right away
     if (!player.isBot) {
         io.to(playerId).emit('yourCards', player.hand);
@@ -339,6 +320,14 @@ function handleMove(roomId, playerId, card) {
     if (!isLeadMove) {
         const leadSuit = room.table[0].symbol;
         if (playedCard.symbol !== leadSuit) {
+            // Lock turn during resolution animation
+            room.currentTurn = null;
+            io.to(roomId).emit('gameUpdated', {
+                table: room.table,
+                currentTurn: null,
+                players: room.players.map(({ hand, ...rest }) => rest)
+            });
+
             setTimeout(() => {
                 const r = rooms[roomId];
                 if (!r || r.gameEnded) return;
@@ -347,7 +336,6 @@ function handleMove(roomId, playerId, card) {
                 const winnerId = getHighestLeadPlayer(trickCards, leadSuit);
                 const winnerPlayer = r.players.find(p => p.id === winnerId);
 
-                // Winner collects all trick cards
                 if (winnerPlayer) {
                     winnerPlayer.hand = sortHand([...winnerPlayer.hand, ...trickCards]);
                     winnerPlayer.handCount = winnerPlayer.hand.length;
@@ -356,28 +344,14 @@ function handleMove(roomId, playerId, card) {
                 r.table = [];
                 r.firstRoundPlayed = true;
 
-                // Register winners BEFORE computing alive/next
                 updateWinners(roomId);
 
-                // Check game end
-                if (r.winners.length >= 4 || !r.gameStarted) {
-                    endGame(roomId);
-                    return;
-                }
-                if (r.winners.length >= 3) {
-                    endGame(roomId);
-                    return;
-                }
+                if (r.winners.length >= 4 || !r.gameStarted) { endGame(roomId); return; }
+                if (r.winners.length >= 3) { endGame(roomId); return; }
 
                 const aliveNow = getAlivePlayers(r);
-                if (aliveNow.length <= 1) {
-                    updateWinners(roomId);
-                    endGame(roomId);
-                    return;
-                }
+                if (aliveNow.length <= 1) { updateWinners(roomId); endGame(roomId); return; }
 
-                // Next turn = winner who collected (must lead next)
-                // But if winner just finished (empty hand), find next alive
                 let nextTurn = winnerId;
                 if (r.winners.some(w => w.id === winnerId)) {
                     nextTurn = getNextActivePlayer(r, winnerId);
@@ -394,7 +368,6 @@ function handleMove(roomId, playerId, card) {
                     players: r.players.map(({ hand, ...rest }) => rest)
                 });
 
-                // Send updated hand to winner (human)
                 if (winnerPlayer && !winnerPlayer.isBot) {
                     io.to(winnerId).emit('yourCards', winnerPlayer.hand);
                 }
@@ -413,7 +386,14 @@ function handleMove(roomId, playerId, card) {
     const aliveNotPlayed = aliveNow.filter(p => !roundPlayers.has(p.id));
 
     if (aliveNotPlayed.length === 0) {
-        // All alive players have played — resolve trick
+        // Lock turn during resolution animation
+        room.currentTurn = null;
+        io.to(roomId).emit('gameUpdated', {
+            table: room.table,
+            currentTurn: null,
+            players: room.players.map(({ hand, ...rest }) => rest)
+        });
+
         setTimeout(() => {
             const r = rooms[roomId];
             if (!r || r.gameEnded) return;
@@ -428,22 +408,13 @@ function handleMove(roomId, playerId, card) {
             r.table = [];
             r.firstRoundPlayed = true;
 
-            // Register winners BEFORE computing next starter
             updateWinners(roomId);
 
-            if (r.winners.length >= 3) {
-                endGame(roomId);
-                return;
-            }
+            if (r.winners.length >= 3) { endGame(roomId); return; }
 
             const aliveAfter = getAlivePlayers(r);
-            if (aliveAfter.length <= 1) {
-                updateWinners(roomId);
-                endGame(roomId);
-                return;
-            }
+            if (aliveAfter.length <= 1) { updateWinners(roomId); endGame(roomId); return; }
 
-            // Next starter = trick winner (or next alive if they finished)
             let nextStarter = getNextStarterFromTrick(r, trickSnapshot, leadSuit);
             if (!nextStarter || r.winners.some(w => w.id === nextStarter)) {
                 nextStarter = getNextActivePlayer(r, winnerId || r.players[0].id);
@@ -467,6 +438,9 @@ function handleMove(roomId, playerId, card) {
     }
 
     // ── Pass to next player in ongoing trick ──────────────────────
+    // FIX: compute nextTurn FIRST, set room.currentTurn, THEN broadcast.
+    // Never broadcast currentTurn: null during an ongoing trick —
+    // that was causing the bot turn to appear frozen after leading the Ace.
     const nextTurn = getNextActivePlayer(room, playerId);
     room.currentTurn = nextTurn;
 
@@ -498,6 +472,7 @@ io.on("connection", (socket) => {
             table: [], winners: [], discardedPile: [],
             missingCards: {}, recentLeadSuits: [],
             currentTurn: null, firstRoundPlayed: false,
+            _botToken: {},
         };
         socket.join(roomId);
         callback(roomId);
@@ -556,6 +531,7 @@ io.on("connection", (socket) => {
         room.table = []; room.winners = []; room.discardedPile = [];
         room.missingCards = {}; room.recentLeadSuits = [];
         room.currentTurn = null; room.firstRoundPlayed = false;
+        room._botToken = {};
         room.players = room.players
             .filter(p => !p.isBot)
             .map((p, i) => ({ ...p, host: i === 0, hand: [], handCount: 0 }));
@@ -587,6 +563,7 @@ io.on("connection", (socket) => {
         room.table = []; room.winners = []; room.discardedPile = [];
         room.missingCards = {}; room.recentLeadSuits = [];
         room.currentTurn = null; room.firstRoundPlayed = false;
+        room._botToken = {};
 
         const botNames = ["Mastermind", "CleverBot", "SharpAI", "TacticBot"];
         while (room.players.length < 4) {
