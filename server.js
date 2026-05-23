@@ -9,18 +9,21 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
     cors: { origin: "*", methods: ["GET", "POST"], credentials: true },
-    transports: ['polling', 'websocket']
+    transports: ['polling', 'websocket'],
+    pingTimeout: 20000,
+    pingInterval: 10000,
 });
 
-// --- 🃏 கார்டு கட்டு உருவாக்கம் (A to 2 Order) ---
+// ─────────────────────────────────────────────
+// 🃏 DECK CREATION
+// ─────────────────────────────────────────────
 const createShuffledDeck = () => {
     const suits = ["Spades", "Hearts", "Clubs", "Diamonds"];
-    const symbols = { "Spades": "♠", "Hearts": "♥", "Clubs": "♣", "Diamonds": "♦" };
+    const symbols = { Spades: "♠", Hearts: "♥", Clubs: "♣", Diamonds: "♦" };
     const ranks = ["2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K", "A"];
     let deck = [];
-
     suits.forEach(suit => {
-        const cardColor = (suit === "Spades" || suit === "Clubs") ? "black" : "#e0115f";
+        const color = suit === "Spades" || suit === "Clubs" ? "black" : "#e0115f";
         ranks.forEach((rank, index) => {
             deck.push({
                 id: `${rank}-${suit}-${Math.random().toString(36).substr(2, 5)}`,
@@ -28,43 +31,449 @@ const createShuffledDeck = () => {
                 symbol: symbols[suit],
                 label: rank,
                 val: index + 2,
-                color: cardColor
+                color
             });
         });
     });
-
     return deck.sort(() => Math.random() - 0.5);
 };
 
-const sortHandBySuitAndValue = (hand) => {
-    const suitOrder = {
-        'Spades': 0,
-        'Hearts': 1,
-        'Diamonds': 2,
-        'Clubs': 3
-    };
-
+const sortHand = (hand) => {
+    const suitOrder = { Spades: 0, Hearts: 1, Clubs: 2, Diamonds: 3 };
     return [...hand].sort((a, b) => {
-        if (suitOrder[a.name] !== suitOrder[b.name]) {
-            return suitOrder[a.name] - suitOrder[b.name];
-        }
+        if (suitOrder[a.name] !== suitOrder[b.name]) return suitOrder[a.name] - suitOrder[b.name];
         return a.val - b.val;
     });
 };
 
+// ─────────────────────────────────────────────
+// ROOM STORE
+// ─────────────────────────────────────────────
 let rooms = {};
 
-io.on("connection", (socket) => {
-    console.log("Player Connected:", socket.id);
+// ─────────────────────────────────────────────
+// GAME HELPER FUNCTIONS (same logic as Game.jsx)
+// ─────────────────────────────────────────────
 
-    // 1. ரூம் உருவாக்குதல்
+function getAlivePlayers(room) {
+    return room.players.filter(
+        p => !room.winners.some(w => w.id === p.id) && p.hand && p.hand.length > 0
+    );
+}
+
+function getHighestLeadPlayer(tableCards, leadSuit) {
+    const highest = [...tableCards]
+        .filter(c => c.symbol === leadSuit)
+        .sort((a, b) => b.val - a.val)[0];
+    return highest ? highest.playedBy : null;
+}
+
+function getNextStarterFromTrick(room, tableCards, leadSuit) {
+    const ranked = [...tableCards]
+        .filter(c => c.symbol === leadSuit)
+        .sort((a, b) => b.val - a.val);
+
+    for (const trickCard of ranked) {
+        const player = room.players.find(p => p.id === trickCard.playedBy);
+        const isWinner = room.winners.some(w => w.id === trickCard.playedBy);
+        const hasCards = (player?.hand?.length ?? 0) > 0;
+        if (player && hasCards && !isWinner) return trickCard.playedBy;
+    }
+    return null;
+}
+
+function getNextActivePlayer(room, currentPlayerId) {
+    const alive = getAlivePlayers(room);
+    if (alive.length === 0) return null;
+
+    const currentIdx = room.players.findIndex(p => p.id === currentPlayerId);
+    for (let i = 1; i <= room.players.length; i++) {
+        const candidate = room.players[(currentIdx + i) % room.players.length];
+        if (alive.some(p => p.id === candidate.id)) return candidate.id;
+    }
+    return alive[0].id;
+}
+
+function rememberMissingSuit(room, playerId, suitSymbol) {
+    if (!room.missingCards[playerId]) room.missingCards[playerId] = new Set();
+    room.missingCards[playerId].add(suitSymbol);
+}
+
+function pushRecentLeadSuit(room, suitSymbol) {
+    room.recentLeadSuits.push(suitSymbol);
+    if (room.recentLeadSuits.length > 6) room.recentLeadSuits.shift();
+}
+
+function finalizeRanks(room) {
+    if (room.winners.length === 3) {
+        const remaining = room.players.find(p => !room.winners.some(w => w.id === p.id));
+        if (remaining && !room.winners.some(w => w.id === remaining.id)) {
+            room.winners.push({ id: remaining.id, name: remaining.name, rank: 4, label: 'Oops! Donkey' });
+        }
+    }
+}
+
+function updateWinners(roomId) {
+    const room = rooms[roomId];
+    if (!room) return false;
+
+    let changed = false;
+
+    room.players.forEach(player => {
+        const alreadyWinner = room.winners.some(w => w.id === player.id);
+        if (!alreadyWinner && player.hand.length === 0) {
+            const rank = room.winners.length + 1;
+            const labels = { 1: '1st Winner', 2: '2nd Winner', 3: '3rd Winner', 4: 'Oops! Donkey' };
+            room.winners.push({ id: player.id, name: player.name, rank, label: labels[rank] || '' });
+            changed = true;
+        }
+    });
+
+    finalizeRanks(room);
+
+    if (changed) {
+        io.to(roomId).emit('winnersUpdated', room.winners);
+    }
+
+    io.to(roomId).emit('playersUpdated', room.players.map(({ hand, ...rest }) => rest));
+
+    return changed;
+}
+
+// ─────────────────────────────────────────────
+// MASTERMIND AI — same logic as Game.jsx
+// ─────────────────────────────────────────────
+
+function chooseLeadCardAI(room, botId) {
+    const bot = room.players.find(p => p.id === botId);
+    const aiHand = bot.hand;
+
+    // First move of entire game: must play Ace of Spades
+    if (!room.firstRoundPlayed) {
+        const aceIdx = aiHand.findIndex(c => c.symbol === '♠' && c.label === 'A');
+        if (aceIdx !== -1) return aiHand[aceIdx];
+    }
+
+    const aliveOpponents = room.players.filter(p =>
+        p.id !== botId &&
+        !room.winners.some(w => w.id === p.id) &&
+        p.hand && p.hand.length > 0
+    );
+
+    // Count void opponents per suit
+    const voidCountBySuit = {};
+    aliveOpponents.forEach(opp => {
+        const missing = room.missingCards[opp.id] || new Set();
+        missing.forEach(suit => {
+            voidCountBySuit[suit] = (voidCountBySuit[suit] || 0) + 1;
+        });
+    });
+
+    let bestCard = null;
+    let bestScore = -Infinity;
+
+    aiHand.forEach(card => {
+        let score = 0;
+        const voidOpponents = voidCountBySuit[card.symbol] || 0;
+        score -= voidOpponents * 40;
+        if (voidOpponents === 0) score += 25;
+        score += (15 - card.val) * 1.5;
+        if (card.val >= 14) score -= 20;
+        if (card.val === 13) score -= 12;
+        const recentSpam = room.recentLeadSuits.filter(s => s === card.symbol).length;
+        score -= recentSpam * 10;
+        const sameSuitCount = aiHand.filter(c => c.symbol === card.symbol).length;
+        score += sameSuitCount * 3;
+        if (voidOpponents === 0 && sameSuitCount >= 3) score += 12;
+        if (score > bestScore) { bestScore = score; bestCard = card; }
+    });
+
+    return bestCard || aiHand[0];
+}
+
+function chooseFollowCardAI(room, botId) {
+    const bot = room.players.find(p => p.id === botId);
+    const aiHand = bot.hand;
+    const leadSuit = room.table[0].symbol;
+
+    const sameSuitCards = aiHand.filter(c => c.symbol === leadSuit).sort((a, b) => a.val - b.val);
+    const currentHigh = [...room.table].filter(c => c.symbol === leadSuit).sort((a, b) => b.val - a.val)[0];
+
+    if (sameSuitCards.length > 0) {
+        const currentHighVal = currentHigh ? currentHigh.val : 0;
+        const winningCards = sameSuitCards.filter(c => c.val > currentHighVal);
+        const losingCards = sameSuitCards.filter(c => c.val <= currentHighVal);
+
+        // Check for future void players
+        const roundPlayedBy = new Set(room.table.map(c => c.playedBy));
+        const remainingAlive = room.players.filter(p =>
+            !roundPlayedBy.has(p.id) &&
+            !room.winners.some(w => w.id === p.id) &&
+            p.hand && p.hand.length > 0 &&
+            p.id !== botId
+        );
+
+        const futureVoidCount = remainingAlive.filter(p => {
+            const missing = room.missingCards[p.id] || new Set();
+            return missing.has(leadSuit);
+        }).length;
+
+        const dangerAlreadyOnTable = room.table.filter(c => c.symbol !== leadSuit).length;
+        const trickIsRisky = futureVoidCount > 0 || dangerAlreadyOnTable > 0;
+
+        if (trickIsRisky) {
+            if (losingCards.length > 0) return losingCards[losingCards.length - 1];
+            return winningCards[0];
+        }
+
+        if (winningCards.length > 0) return winningCards[0];
+        return sameSuitCards[0];
+    }
+
+    // Void in lead suit — dump highest value card
+    rememberMissingSuit(room, botId, leadSuit);
+    return [...aiHand].sort((a, b) => b.val - a.val)[0];
+}
+
+// ─────────────────────────────────────────────
+// BOT TURN HANDLER
+// ─────────────────────────────────────────────
+
+function scheduleBotTurn(roomId, botId, delay = 900) {
+    const room = rooms[roomId];
+    if (!room || !room.gameStarted) return;
+
+    const bot = room.players.find(p => p.id === botId);
+    if (!bot || !bot.isBot || !bot.hand || bot.hand.length === 0) return;
+    if (room.winners.some(w => w.id === botId)) return;
+
+    setTimeout(() => {
+        const r = rooms[roomId];
+        if (!r || !r.gameStarted || r.currentTurn !== botId) return;
+
+        const b = r.players.find(p => p.id === botId);
+        if (!b || !b.hand || b.hand.length === 0) return;
+        if (r.winners.some(w => w.id === botId)) return;
+
+        let cardToPlay;
+        if (r.table.length === 0) {
+            cardToPlay = chooseLeadCardAI(r, botId);
+        } else {
+            cardToPlay = chooseFollowCardAI(r, botId);
+        }
+
+        if (cardToPlay) handleMove(roomId, botId, cardToPlay);
+    }, delay);
+}
+
+// ─────────────────────────────────────────────
+// CORE MOVE HANDLER (mirrors Game.jsx executeMove)
+// ─────────────────────────────────────────────
+
+function handleMove(roomId, playerId, card) {
+    const room = rooms[roomId];
+    if (!room || !room.gameStarted) return;
+    if (room.currentTurn !== playerId) return;
+
+    const player = room.players.find(p => p.id === playerId);
+    if (!player || !player.hand) return;
+    if (room.winners.some(w => w.id === playerId)) return;
+
+    // Remove card from hand
+    const cardInHand = player.hand.find(c => c.id === card.id);
+    if (!cardInHand) return;
+
+    player.hand = player.hand.filter(c => c.id !== card.id);
+    player.handCount = player.hand.length;
+
+    const playedCard = { ...cardInHand, playedBy: playerId };
+    const isLeadMove = room.table.length === 0;
+
+    room.table.push(playedCard);
+
+    // Track lead suit
+    if (isLeadMove) {
+        pushRecentLeadSuit(room, playedCard.symbol);
+    }
+
+    // Track void (missing suit)
+    if (!isLeadMove) {
+        const leadSuit = room.table[0].symbol;
+        if (playedCard.symbol !== leadSuit) {
+            rememberMissingSuit(room, playerId, leadSuit);
+        }
+    }
+
+    // Emit updated game state
+    io.to(roomId).emit('gameUpdated', {
+        table: room.table,
+        currentTurn: null,
+        players: room.players.map(({ hand, ...rest }) => rest)
+    });
+
+    // Send updated hand to human player
+    if (!player.isBot) {
+        io.to(playerId).emit('yourCards', player.hand);
+    }
+
+    const alive = getAlivePlayers(room);
+
+    // ── Check immediate cut (off-suit play) ──────────────────────
+    if (!isLeadMove) {
+        const leadSuit = room.table[0].symbol;
+        if (playedCard.symbol !== leadSuit) {
+            // This player cut — trick ends immediately
+            setTimeout(() => {
+                const r = rooms[roomId];
+                if (!r) return;
+
+                const winnerId = getHighestLeadPlayer(r.table, leadSuit);
+                const winnerPlayer = r.players.find(p => p.id === winnerId);
+                const trickCards = [...r.table];
+
+                if (winnerPlayer) {
+                    winnerPlayer.hand = sortHand([...winnerPlayer.hand, ...trickCards]);
+                    winnerPlayer.handCount = winnerPlayer.hand.length;
+                }
+
+                r.table = [];
+                r.firstRoundPlayed = true;
+
+                updateWinners(roomId);
+
+                io.to(roomId).emit('strikeOccurred', {
+                    loser: playerId,
+                    winner: winnerId,
+                    table: trickCards,
+                    nextTurn: winnerId,
+                    players: r.players.map(({ hand, ...rest }) => rest)
+                });
+
+                if (!winnerPlayer?.isBot) {
+                    io.to(winnerId).emit('yourCards', winnerPlayer.hand);
+                }
+
+                // Check game over
+                const aliveNow = getAlivePlayers(r);
+                if (r.winners.length >= 3) {
+                    endGame(roomId);
+                    return;
+                }
+
+                if (aliveNow.length <= 1) {
+                    updateWinners(roomId);
+                    endGame(roomId);
+                    return;
+                }
+
+                r.currentTurn = winnerId;
+
+                io.to(roomId).emit('gameUpdated', {
+                    table: [],
+                    currentTurn: winnerId,
+                    players: r.players.map(({ hand, ...rest }) => rest)
+                });
+
+                if (winnerId && winnerId.startsWith('bot-')) scheduleBotTurn(roomId, winnerId, 900);
+            }, 800);
+            return;
+        }
+    }
+
+    // ── Check if trick is complete (all alive players played) ────
+    const roundPlayers = new Set(room.table.map(c => c.playedBy));
+    const aliveNotPlayed = alive.filter(p => !roundPlayers.has(p.id));
+
+    if (aliveNotPlayed.length === 0) {
+        // Trick complete
+        setTimeout(() => {
+            const r = rooms[roomId];
+            if (!r) return;
+
+            const leadSuit = r.table[0].symbol;
+            const winnerId = getHighestLeadPlayer(r.table, leadSuit);
+            const trickSnapshot = [...r.table];
+
+            r.discardedPile.push(...r.table);
+            r.table = [];
+            r.firstRoundPlayed = true;
+
+            updateWinners(roomId);
+
+            let nextStarter = getNextStarterFromTrick(r, trickSnapshot, leadSuit);
+            if (!nextStarter) nextStarter = getNextActivePlayer(r, winnerId);
+
+            const aliveNow = getAlivePlayers(r);
+            if (r.winners.length >= 3) {
+                endGame(roomId);
+                return;
+            }
+            if (aliveNow.length <= 1) {
+                updateWinners(roomId);
+                endGame(roomId);
+                return;
+            }
+
+            r.currentTurn = nextStarter;
+
+            io.to(roomId).emit('roundComplete', {
+                winner: winnerId,
+                table: trickSnapshot,
+                nextTurn: nextStarter,
+                players: r.players.map(({ hand, ...rest }) => rest),
+                discardedCount: r.discardedPile.length
+            });
+
+            if (nextStarter && nextStarter.startsWith('bot-')) scheduleBotTurn(roomId, nextStarter, 900);
+        }, 800);
+        return;
+    }
+
+    // ── Next player in trick ──────────────────────────────────────
+    const nextTurn = getNextActivePlayer(room, playerId);
+    room.currentTurn = nextTurn;
+
+    io.to(roomId).emit('gameUpdated', {
+        table: room.table,
+        currentTurn: nextTurn,
+        players: room.players.map(({ hand, ...rest }) => rest)
+    });
+
+    if (nextTurn && nextTurn.startsWith('bot-')) scheduleBotTurn(roomId, nextTurn, 900);
+}
+
+// ─────────────────────────────────────────────
+// END GAME
+// ─────────────────────────────────────────────
+
+function endGame(roomId) {
+    const room = rooms[roomId];
+    if (!room) return;
+
+    finalizeRanks(room);
+    room.gameStarted = false;
+
+    io.to(roomId).emit('winnersUpdated', room.winners);
+    io.to(roomId).emit('gameFinished', {
+        winners: room.winners,
+        players: room.players.map(({ hand, ...rest }) => rest)
+    });
+}
+
+// ─────────────────────────────────────────────
+// SOCKET EVENTS
+// ─────────────────────────────────────────────
+
+io.on("connection", (socket) => {
+    console.log("Connected:", socket.id);
+
+    // 1. CREATE ROOM
     socket.on("createRoom", ({ playerName }, callback) => {
         const roomId = Math.random().toString(36).substring(2, 8).toUpperCase();
-
         rooms[roomId] = {
             players: [{
                 id: socket.id,
-                name: playerName,
+                name: playerName.trim(),
                 host: true,
                 isBot: false,
                 hand: [],
@@ -77,86 +486,43 @@ io.on("connection", (socket) => {
             discardedPile: [],
             missingCards: {},
             recentLeadSuits: [],
-            loadedPlayerId: null,
-            lastRoundType: null
+            currentTurn: null,
+            firstRoundPlayed: false,
         };
-
         socket.join(roomId);
         callback(roomId);
     });
 
-    // 2. ரூமில் இணைதல்
+    // 2. JOIN ROOM
     socket.on("joinRoom", ({ roomId, playerName }, callback) => {
         const room = rooms[roomId];
+        if (!room) return callback({ success: false, message: "Room not found!" });
+        if (room.gameStarted) return callback({ success: false, message: "Game already started!" });
 
-        if (!room) {
-            return callback({
-                success: false,
-                message: "Room not found!"
-            });
-        }
-
-        if (room.gameStarted) {
-            return callback({
-                success: false,
-                message: "Game already started!"
-            });
-        }
-
-        const existingBySocket = room.players.find(p => p.id === socket.id);
-
-        if (existingBySocket) {
-            existingBySocket.isConnected = true;
+        // Reconnect by socket id
+        const bySocket = room.players.find(p => p.id === socket.id);
+        if (bySocket) {
+            bySocket.isConnected = true;
             socket.join(roomId);
-
-            io.to(roomId).emit(
-                "playersUpdated",
-                room.players.map(({ hand, ...rest }) => rest)
-            );
-
-            return callback({
-                success: true,
-                rejoined: true
-            });
+            io.to(roomId).emit("playersUpdated", room.players.map(({ hand, ...r }) => r));
+            return callback({ success: true, rejoined: true });
         }
 
-        const existingByName = room.players.find(
-            p =>
-                !p.isBot &&
-                p.name.trim().toLowerCase() === playerName.trim().toLowerCase()
+        // Reconnect by name
+        const byName = room.players.find(
+            p => !p.isBot && p.name.trim().toLowerCase() === playerName.trim().toLowerCase()
         );
-
-        if (existingByName) {
-            console.log("Reconnecting player:", existingByName.name);
-
-            existingByName.id = socket.id;
-            existingByName.isConnected = true;
-
+        if (byName) {
+            byName.id = socket.id;
+            byName.isConnected = true;
             socket.join(roomId);
-
-            io.to(roomId).emit(
-                "playersUpdated",
-                room.players.map(({ hand, ...rest }) => rest)
-            );
-
-            if (existingByName.hand?.length > 0) {
-                io.to(socket.id).emit("yourCards", existingByName.hand);
-            }
-
-            return callback({
-                success: true,
-                rejoined: true
-            });
+            io.to(roomId).emit("playersUpdated", room.players.map(({ hand, ...r }) => r));
+            if (byName.hand?.length > 0) io.to(socket.id).emit("yourCards", byName.hand);
+            return callback({ success: true, rejoined: true });
         }
 
         const realPlayers = room.players.filter(p => !p.isBot);
-
-        if (realPlayers.length >= 4) {
-            return callback({
-                success: false,
-                message: "Room full!"
-            });
-        }
+        if (realPlayers.length >= 4) return callback({ success: false, message: "Room full!" });
 
         room.players.push({
             id: socket.id,
@@ -167,126 +533,61 @@ io.on("connection", (socket) => {
             handCount: 0,
             isConnected: true
         });
-
         socket.join(roomId);
-
-        io.to(roomId).emit(
-            "playersUpdated",
-            room.players.map(({ hand, ...rest }) => rest)
-        );
-
-        callback({
-            success: true
-        });
+        io.to(roomId).emit("playersUpdated", room.players.map(({ hand, ...r }) => r));
+        callback({ success: true });
     });
 
-    // NEW: room state request
+    // 3. REQUEST ROOM STATE
     socket.on("requestRoomState", ({ roomId }) => {
         const room = rooms[roomId];
         if (!room) return;
-
         io.to(roomId).emit("roomState", {
             roomId,
-            players: room.players.map(({ hand, ...rest }) => rest)
+            players: room.players.map(({ hand, ...r }) => r)
         });
     });
 
-    // NEW: return all players to lobby
+    // 4. RETURN TO LOBBY
     socket.on("returnToLobby", ({ roomId }) => {
         const room = rooms[roomId];
         if (!room) return;
-
         room.gameStarted = false;
         room.table = [];
         room.winners = [];
         room.discardedPile = [];
         room.missingCards = {};
         room.recentLeadSuits = [];
-        room.loadedPlayerId = null;
-        room.lastRoundType = null;
-
+        room.currentTurn = null;
+        room.firstRoundPlayed = false;
         room.players = room.players
-            .filter(player => !player.isBot)
-            .map((player, index) => ({
-                ...player,
-                host: index === 0 ? true : player.host,
-                hand: [],
-                handCount: 0,
-                isConnected: player.isConnected !== false
-            }));
-
-        io.to(roomId).emit(
-            "playersUpdated",
-            room.players.map(({ hand, ...rest }) => rest)
-        );
-
-        io.to(roomId).emit("roomState", {
-            roomId,
-            players: room.players.map(({ hand, ...rest }) => rest)
-        });
+            .filter(p => !p.isBot)
+            .map((p, i) => ({ ...p, host: i === 0 ? true : p.host, hand: [], handCount: 0 }));
+        io.to(roomId).emit("playersUpdated", room.players.map(({ hand, ...r }) => r));
+        io.to(roomId).emit("roomState", { roomId, players: room.players.map(({ hand, ...r }) => r) });
     });
 
-    // NEW: host remove player
+    // 5. REMOVE PLAYER
     socket.on("removePlayer", ({ roomId, targetPlayerId }, callback) => {
         const room = rooms[roomId];
-
-        if (!room) {
-            return callback?.({
-                success: false,
-                message: "Room not found"
-            });
-        }
-
+        if (!room) return callback?.({ success: false, message: "Room not found" });
         const requester = room.players.find(p => p.id === socket.id);
-
-        if (!requester || !requester.host) {
-            return callback?.({
-                success: false,
-                message: "Only host can remove players"
-            });
-        }
-
-        if (targetPlayerId === socket.id) {
-            return callback?.({
-                success: false,
-                message: "Host cannot remove self"
-            });
-        }
-
-        const targetPlayer = room.players.find(p => p.id === targetPlayerId);
-
-        if (!targetPlayer) {
-            return callback?.({
-                success: false,
-                message: "Player not found"
-            });
-        }
-
+        if (!requester?.host) return callback?.({ success: false, message: "Only host can remove players" });
+        if (targetPlayerId === socket.id) return callback?.({ success: false, message: "Host cannot remove self" });
         room.players = room.players.filter(p => p.id !== targetPlayerId);
-
-        io.to(targetPlayerId).emit("removedFromRoom", {
-            message: "You were removed from the room"
-        });
-
-        io.to(roomId).emit(
-            "playersUpdated",
-            room.players.map(({ hand, ...rest }) => rest)
-        );
-
-        io.to(roomId).emit("roomState", {
-            roomId,
-            players: room.players.map(({ hand, ...rest }) => rest)
-        });
-
-        callback?.({
-            success: true
-        });
+        io.to(targetPlayerId).emit("removedFromRoom", { message: "You were removed from the room" });
+        io.to(roomId).emit("playersUpdated", room.players.map(({ hand, ...r }) => r));
+        io.to(roomId).emit("roomState", { roomId, players: room.players.map(({ hand, ...r }) => r) });
+        callback?.({ success: true });
     });
 
-    // 3. ஆட்டத்தைத் தொடங்குதல்
+    // 6. START GAME
     socket.on("startGame", ({ roomId }) => {
         const room = rooms[roomId];
         if (!room) return;
+
+        const requester = room.players.find(p => p.id === socket.id);
+        if (!requester?.host) return;
 
         room.gameStarted = true;
         room.table = [];
@@ -294,14 +595,16 @@ io.on("connection", (socket) => {
         room.discardedPile = [];
         room.missingCards = {};
         room.recentLeadSuits = [];
-        room.loadedPlayerId = null;
-        room.lastRoundType = null;
+        room.currentTurn = null;
+        room.firstRoundPlayed = false;
 
+        // Fill bots
+        const botNames = ["Mastermind", "Clever Bot", "SharpAI", "TacticBot"];
         while (room.players.length < 4) {
             const botId = `bot-${Math.random().toString(36).substr(2, 5)}`;
             room.players.push({
                 id: botId,
-                name: `Bot ${room.players.length}`,
+                name: botNames[room.players.length - 1] || `Bot ${room.players.length}`,
                 isBot: true,
                 hand: [],
                 handCount: 13,
@@ -310,405 +613,63 @@ io.on("connection", (socket) => {
         }
 
         const deck = createShuffledDeck();
-        let starterId = '';
+        let starterId = null;
 
         room.players.forEach((player, i) => {
-            player.hand = sortHandBySuitAndValue(deck.slice(i * 13, (i + 1) * 13));
+            player.hand = sortHand(deck.slice(i * 13, (i + 1) * 13));
             player.handCount = 13;
             if (player.hand.some(c => c.symbol === '♠' && c.label === 'A')) starterId = player.id;
             if (!player.isBot) io.to(player.id).emit("yourCards", player.hand);
         });
 
+        room.currentTurn = starterId || room.players[0].id;
+
         io.to(roomId).emit("gameStarted", {
-            currentTurn: starterId,
-            players: room.players.map(({ hand, ...rest }) => rest)
+            currentTurn: room.currentTurn,
+            players: room.players.map(({ hand, ...r }) => r)
         });
 
-        if (starterId.startsWith('bot-')) checkBotTurn(roomId, starterId);
-    });
-
-    // கார்டுகளை மீண்டும் கேட்கும் வசதி
-    socket.on("requestMyCards", ({ roomId }) => {
-        const room = rooms[roomId];
-        if (room) {
-            const player = room.players.find(p => p.id === socket.id);
-            if (player && player.hand.length > 0) {
-                socket.emit("yourCards", player.hand);
-            }
+        if (room.currentTurn && room.currentTurn.startsWith('bot-')) {
+            scheduleBotTurn(roomId, room.currentTurn, 1500);
         }
     });
 
+    // 7. REQUEST MY CARDS
+    socket.on("requestMyCards", ({ roomId }) => {
+        const room = rooms[roomId];
+        if (!room) return;
+        const player = room.players.find(p => p.id === socket.id);
+        if (player?.hand?.length > 0) socket.emit("yourCards", player.hand);
+    });
+
+    // 8. PLAY CARD
     socket.on("playCard", ({ roomId, card }) => {
+        const room = rooms[roomId];
+        if (!room || !room.gameStarted) return;
+        if (room.currentTurn !== socket.id) return;
         handleMove(roomId, socket.id, card);
     });
 
-    function getNextPlayer(roomId, currentPlayerId) {
-        const room = rooms[roomId];
-        if (!room || !room.players.length) return null;
-
-        const playerIndex = room.players.findIndex(p => p.id === currentPlayerId);
-        if (playerIndex === -1) return null;
-
-        for (let i = 1; i <= room.players.length; i++) {
-            const nextIdx = (playerIndex + i) % room.players.length;
-            const nextPlayer = room.players[nextIdx];
-            const isWinner = room.winners.some(w => w.id === nextPlayer.id);
-            const hasCards = (nextPlayer.hand?.length ?? 0) > 0;
-
-            if (nextPlayer && hasCards && !isWinner) {
-                return nextPlayer.id;
-            }
-        }
-
-        return null;
-    }
-
-    function rememberMissingSuit(room, playerId, suitSymbol) {
-        if (!room.missingCards[playerId]) room.missingCards[playerId] = [];
-        if (!room.missingCards[playerId].includes(suitSymbol)) {
-            room.missingCards[playerId].push(suitSymbol);
-        }
-    }
-
-    function pushRecentLeadSuit(room, suitSymbol) {
-        room.recentLeadSuits.push(suitSymbol);
-        if (room.recentLeadSuits.length > 8) {
-            room.recentLeadSuits.shift();
-        }
-    }
-
-    function getHighestLeadCard(cards, leadSuit) {
-        return [...cards]
-            .filter(c => c.symbol === leadSuit)
-            .sort((a, b) => b.val - a.val)[0];
-    }
-
-    function getNextStarterFromTable(room, tableCards, leadSuit) {
-        const rankedLeadCards = [...tableCards]
-            .filter(c => c.symbol === leadSuit)
-            .sort((a, b) => b.val - a.val);
-
-        for (const trickCard of rankedLeadCards) {
-            const player = room.players.find(p => p.id === trickCard.playedBy);
-            const isWinner = room.winners.some(w => w.id === trickCard.playedBy);
-            const hasCards = (player?.hand?.length ?? 0) > 0;
-
-            if (player && hasCards && !isWinner) {
-                return trickCard.playedBy;
-            }
-        }
-
-        return null;
-    }
-
-    function handleMove(roomId, playerId, card) {
-        const room = rooms[roomId];
-        if (!room || !room.gameStarted) return;
-
-        const player = room.players.find(p => p.id === playerId);
-        if (!player) return;
-
-        player.hand = player.hand.filter(c => c.id !== card.id);
-        player.handCount = player.hand.length;
-
-        const playedCard = { ...card, playedBy: playerId };
-        room.table.push(playedCard);
-
-        if (room.table.length === 1) {
-            pushRecentLeadSuit(room, playedCard.symbol);
-        }
-
-        if (room.table.length > 1) {
-            const leadS = room.table[0].symbol;
-            if (playedCard.symbol !== leadS) {
-                rememberMissingSuit(room, playerId, leadS);
-            }
-        }
-
-        io.to(roomId).emit("gameUpdated", {
-            table: room.table,
-            currentTurn: null,
-            players: room.players.map(({ hand, ...rest }) => rest)
-        });
-
-        setTimeout(() => {
-            if (!room.table || room.table.length === 0) return;
-
-            const leadSuit = room.table[0].symbol;
-            const latestCard = room.table[room.table.length - 1];
-
-            if (room.table.length > 1 && latestCard.symbol !== leadSuit) {
-                const highestInLead = getHighestLeadCard(room.table, leadSuit);
-                const loadedPlayerId = highestInLead.playedBy;
-                const loadedPlayer = room.players.find(p => p.id === loadedPlayerId);
-
-                const cardsFromTable = [...room.table];
-                loadedPlayer.hand = sortHandBySuitAndValue([...loadedPlayer.hand, ...cardsFromTable]);
-                loadedPlayer.handCount = loadedPlayer.hand.length;
-
-                room.loadedPlayerId = loadedPlayerId;
-                room.lastRoundType = 'cut';
-
-                room.table = [];
-
-                updateWinners(roomId);
-
-                io.to(roomId).emit("strikeOccurred", {
-                    loser: loadedPlayerId,
-                    table: cardsFromTable,
-                    nextTurn: loadedPlayerId,
-                    updatedHand: loadedPlayer.hand,
-                    players: room.players.map(({ hand, ...rest }) => rest)
-                });
-
-                if (room.gameStarted && loadedPlayerId.startsWith('bot-')) checkBotTurn(roomId, loadedPlayerId);
-                return;
-            }
-
-            const activePlayersNow = room.players.filter(p =>
-                p.hand.length > 0 &&
-                !room.winners.some(w => w.id === p.id)
-            ).length;
-
-            if (activePlayersNow === 0) {
-                updateWinners(roomId);
-                return;
-            }
-
-            if (room.table.length === activePlayersNow) {
-                const highestLead = getHighestLeadCard(room.table, leadSuit);
-                const roundWinnerId = highestLead.playedBy;
-                const trickSnapshot = [...room.table];
-
-                room.discardedPile.push(...room.table);
-                room.table = [];
-                room.loadedPlayerId = null;
-                room.lastRoundType = 'normal';
-
-                updateWinners(roomId);
-
-                let nextStarterId = getNextStarterFromTable(room, trickSnapshot, leadSuit);
-
-                if (!nextStarterId) {
-                    nextStarterId = getNextPlayer(roomId, roundWinnerId);
-                }
-
-                io.to(roomId).emit("roundComplete", {
-                    winner: roundWinnerId,
-                    table: trickSnapshot,
-                    nextTurn: nextStarterId,
-                    players: room.players.map(({ hand, ...rest }) => rest)
-                });
-
-                if (room.gameStarted && nextStarterId && nextStarterId.startsWith('bot-')) checkBotTurn(roomId, nextStarterId);
-            } else {
-                let nextTurnId = getNextPlayer(roomId, playerId);
-
-                if (!nextTurnId) {
-                    updateWinners(roomId);
-                    return;
-                }
-
-                io.to(roomId).emit("gameUpdated", {
-                    table: room.table,
-                    currentTurn: nextTurnId,
-                    players: room.players.map(({ hand, ...rest }) => rest)
-                });
-
-                if (nextTurnId && nextTurnId.startsWith('bot-')) checkBotTurn(roomId, nextTurnId);
-            }
-        }, 1200);
-    }
-
-    function updateWinners(roomId) {
-        const room = rooms[roomId];
-        if (!room) return;
-
-        let changed = false;
-
-        room.players.forEach(player => {
-            const alreadyWinner = room.winners.some(w => w.id === player.id);
-
-            if (player.hand.length === 0 && !alreadyWinner) {
-                room.winners.push({
-                    id: player.id,
-                    name: player.name,
-                    rank: room.winners.length + 1
-                });
-                changed = true;
-                console.log(`🏆 Winner added: ${player.name}`);
-            }
-        });
-
-        io.to(roomId).emit(
-            "playersUpdated",
-            room.players.map(({ hand, ...rest }) => rest)
-        );
-
-        if (changed) {
-            io.to(roomId).emit("winnersUpdated", room.winners);
-        }
-
-        const totalFinished = room.winners.length;
-
-        if (totalFinished >= 3) {
-            const donkey = room.players.find(
-                p => !room.winners.some(w => w.id === p.id)
-            );
-
-            if (donkey && !room.winners.some(w => w.id === donkey.id)) {
-                room.winners.push({
-                    id: donkey.id,
-                    name: donkey.name,
-                    rank: 4
-                });
-            }
-
-            room.gameStarted = false;
-
-            io.to(roomId).emit("winnersUpdated", room.winners);
-            io.to(roomId).emit("gameFinished", {
-                winners: room.winners,
-                players: room.players.map(({ hand, ...rest }) => rest)
-            });
-        }
-    }
-
-    // 2. AI BOT TACTICAL LOGIC (பாதுகாப்பு விதிகள்)
-    function checkBotTurn(roomId, botId) {
-        const room = rooms[roomId];
-        if (!room || !room.gameStarted) return;
-        const bot = room.players.find(p => p.id === botId);
-        if (!bot || !bot.isBot || room.winners.some(w => w.id === botId)) return;
-        if (bot.hand.length <= 0 || room.winners.some(w => w.id === botId)) return;
-
-        setTimeout(() => {
-            let cardToPlay;
-            const turnOrder = room.players.map(p => p.id);
-            const nextPlayerId = turnOrder[(turnOrder.indexOf(botId) + 1) % 4];
-            const nextMissing = room.missingCards[nextPlayerId] || [];
-            const recentLeads = room.recentLeadSuits.slice(-4);
-
-            if (room.table.length === 0) {
-                const aceSpade = bot.hand.find(c => c.symbol === '♠' && c.label === 'A' && room.discardedPile.length === 0);
-
-                if (aceSpade) {
-                    cardToPlay = aceSpade;
-                } else if (room.loadedPlayerId === botId && room.lastRoundType === 'cut') {
-                    let bestCard = null;
-                    let bestScore = -Infinity;
-
-                    bot.hand.forEach(card => {
-                        let score = 0;
-
-                        if (!nextMissing.includes(card.symbol)) score += 30;
-                        else score -= 25;
-
-                        score -= card.val * 2;
-
-                        const repetition = recentLeads.filter(s => s === card.symbol).length;
-                        score -= repetition * 5;
-
-                        const sameSuitCount = bot.hand.filter(c => c.symbol === card.symbol).length;
-                        if (sameSuitCount >= 2) score += 4;
-
-                        if (score > bestScore) {
-                            bestScore = score;
-                            bestCard = card;
-                        }
-                    });
-
-                    cardToPlay = bestCard || sortHandBySuitAndValue(bot.hand)[0];
-                } else {
-                    let bestCard = null;
-                    let bestScore = -Infinity;
-
-                    bot.hand.forEach(card => {
-                        let score = 0;
-
-                        if (!nextMissing.includes(card.symbol)) score += 18;
-                        else score -= 18;
-
-                        score -= card.val * 0.35;
-
-                        const repetition = recentLeads.filter(s => s === card.symbol).length;
-                        score -= repetition * 6;
-
-                        const sameSuitCount = bot.hand.filter(c => c.symbol === card.symbol).length;
-                        if (sameSuitCount >= 3) score += 5;
-
-                        if (card.val >= 13 && nextMissing.includes(card.symbol)) score -= 10;
-                        if (card.val <= 5) score += 8;
-
-                        if (score > bestScore) {
-                            bestScore = score;
-                            bestCard = card;
-                        }
-                    });
-
-                    cardToPlay = bestCard || sortHandBySuitAndValue(bot.hand)[0];
-                }
-            } else {
-                const leadSuit = room.table[0].symbol;
-                const sameSuit = bot.hand.filter(c => c.symbol === leadSuit).sort((a, b) => a.val - b.val);
-
-                if (sameSuit.length > 0) {
-                    const currentHigh = [...room.table]
-                        .filter(c => c.symbol === leadSuit)
-                        .sort((a, b) => b.val - a.val)[0];
-
-                    if (room.loadedPlayerId === botId && room.lastRoundType === 'cut') {
-                        cardToPlay = sameSuit[0];
-                    } else {
-                        cardToPlay = sameSuit.find(c => c.val > currentHigh.val) || sameSuit[0];
-                    }
-                } else {
-                    rememberMissingSuit(room, botId, leadSuit);
-                    cardToPlay = [...bot.hand].sort((a, b) => b.val - a.val)[0];
-                }
-            }
-
-            if (cardToPlay) handleMove(roomId, botId, cardToPlay);
-        }, 1500);
-    }
-
-    // --- 🚨 NEW: CONNECTION TRACKING LOGIC ---
+    // 9. DISCONNECT
     socket.on("disconnect", () => {
         console.log("Disconnected:", socket.id);
-
         for (const roomId in rooms) {
             const room = rooms[roomId];
-            const player = room.players.find(
-                p => p.id === socket.id
-            );
-
+            const player = room.players.find(p => p.id === socket.id);
             if (!player) continue;
-
             player.isConnected = false;
-
-            console.log(`${player.name} went offline`);
-
-            io.to(roomId).emit(
-                "playersUpdated",
-                room.players.map(({ hand, ...rest }) => rest)
-            );
-
-            const humansOnline = room.players.some(
-                p => !p.isBot && p.isConnected
-            );
-
+            io.to(roomId).emit("playersUpdated", room.players.map(({ hand, ...r }) => r));
+            const humansOnline = room.players.some(p => !p.isBot && p.isConnected);
             if (!humansOnline) {
                 console.log(`Deleting empty room ${roomId}`);
                 delete rooms[roomId];
             }
-
             break;
         }
     });
 });
 
 const PORT = process.env.PORT || 3000;
-
 server.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Server is live and running on port ${PORT}`);
+    console.log(`🚀 Server running on port ${PORT}`);
 });
