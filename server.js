@@ -574,88 +574,71 @@ io.on("connection", (socket) => {
         }
     }
 
-    // ── AI BOT TACTICAL LOGIC (same mastermind as offline Game_fixed3.jsx) ──
+    // 2. AI BOT TACTICAL LOGIC (பாதுகாப்பு விதிகள்)
     function checkBotTurn(roomId, botId) {
         const room = rooms[roomId];
         if (!room || !room.gameStarted) return;
         const bot = room.players.find(p => p.id === botId);
         if (!bot || !bot.isBot || room.winners.some(w => w.id === botId)) return;
-        if (bot.hand.length <= 0) return;
+        if (bot.hand.length <= 0 || room.winners.some(w => w.id === botId)) return;
 
         setTimeout(() => {
-            // Re-validate after delay (game state may have changed)
-            if (!room.gameStarted) return;
-            if (room.winners.some(w => w.id === botId)) return;
-            if (bot.hand.length <= 0) return;
-
             let cardToPlay;
+            const turnOrder = room.players.map(p => p.id);
+            const nextPlayerId = turnOrder[(turnOrder.indexOf(botId) + 1) % 4];
+            const nextMissing = room.missingCards[nextPlayerId] || [];
+            const recentLeads = room.recentLeadSuits.slice(-4);
 
             if (room.table.length === 0) {
-                // ── LEAD LOGIC ──────────────────────────────────────────────
+                const aceSpade = bot.hand.find(c => c.symbol === '♠' && c.label === 'A' && room.discardedPile.length === 0);
 
-                // First card of entire game: must play Ace of Spades
-                const aceSpade = bot.hand.find(
-                    c => c.symbol === '♠' && c.label === 'A' && room.discardedPile.length === 0
-                );
                 if (aceSpade) {
                     cardToPlay = aceSpade;
-                } else {
-                    // ── Master-mind lead: check ALL alive opponents for voids ──
-                    const alivePlayers = room.players.filter(p =>
-                        p.id !== botId &&
-                        (p.hand?.length ?? 0) > 0 &&
-                        !room.winners.some(w => w.id === p.id)
-                    );
-
-                    // Build void count per suit across all alive opponents
-                    const voidCountBySuit = {};
-                    alivePlayers.forEach(opponent => {
-                        const opponentMissing = room.missingCards[opponent.id] || [];
-                        opponentMissing.forEach(suit => {
-                            voidCountBySuit[suit] = (voidCountBySuit[suit] || 0) + 1;
-                        });
-                    });
-
-                    // Find the next player in turn order to weigh heavily
-                    const turnOrder = room.players.map(p => p.id);
-                    const nextPlayerId = turnOrder[(turnOrder.indexOf(botId) + 1) % turnOrder.length];
-                    const nextMissing = room.missingCards[nextPlayerId] || [];
-
-                    const recentLeads = room.recentLeadSuits.slice(-6);
-
+                } else if (room.loadedPlayerId === botId && room.lastRoundType === 'cut') {
                     let bestCard = null;
                     let bestScore = -Infinity;
 
                     bot.hand.forEach(card => {
                         let score = 0;
 
-                        // Count how many alive opponents are void in this suit
-                        const voidOpponents = voidCountBySuit[card.symbol] || 0;
+                        if (!nextMissing.includes(card.symbol)) score += 30;
+                        else score -= 25;
 
-                        // Heavy penalty per void opponent (they will cut/dump)
-                        score -= voidOpponents * 40;
+                        score -= card.val * 2;
 
-                        // Extra penalty if next player specifically is void
-                        if (nextMissing.includes(card.symbol)) score -= 25;
+                        const repetition = recentLeads.filter(s => s === card.symbol).length;
+                        score -= repetition * 5;
 
-                        // Bonus for suits where zero opponents are void (safe lead)
-                        if (voidOpponents === 0) score += 25;
-
-                        // Penalty for high-value cards (likely to win = collect danger dumps)
-                        if (card.val >= 14) score -= 20; // Ace
-                        if (card.val >= 13) score -= 12; // King
-                        if (card.val >= 12) score -= 6;  // Queen
-
-                        // Slight prefer low cards (less exposure)
-                        score += (15 - card.val) * 0.5;
-
-                        // Anti-spam: penalise suits repeated recently as lead
-                        const recentSpam = recentLeads.filter(s => s === card.symbol).length;
-                        score -= recentSpam * 10;
-
-                        // Prefer suits bot holds many of (control / reduce hand)
                         const sameSuitCount = bot.hand.filter(c => c.symbol === card.symbol).length;
-                        score += sameSuitCount * 2;
+                        if (sameSuitCount >= 2) score += 4;
+
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestCard = card;
+                        }
+                    });
+
+                    cardToPlay = bestCard || sortHandBySuitAndValue(bot.hand)[0];
+                } else {
+                    let bestCard = null;
+                    let bestScore = -Infinity;
+
+                    bot.hand.forEach(card => {
+                        let score = 0;
+
+                        if (!nextMissing.includes(card.symbol)) score += 18;
+                        else score -= 18;
+
+                        score -= card.val * 0.35;
+
+                        const repetition = recentLeads.filter(s => s === card.symbol).length;
+                        score -= repetition * 6;
+
+                        const sameSuitCount = bot.hand.filter(c => c.symbol === card.symbol).length;
+                        if (sameSuitCount >= 3) score += 5;
+
+                        if (card.val >= 13 && nextMissing.includes(card.symbol)) score -= 10;
+                        if (card.val <= 5) score += 8;
 
                         if (score > bestScore) {
                             bestScore = score;
@@ -665,71 +648,28 @@ io.on("connection", (socket) => {
 
                     cardToPlay = bestCard || sortHandBySuitAndValue(bot.hand)[0];
                 }
-
             } else {
-                // ── FOLLOW LOGIC ─────────────────────────────────────────────
                 const leadSuit = room.table[0].symbol;
-                const sameSuit = bot.hand
-                    .filter(c => c.symbol === leadSuit)
-                    .sort((a, b) => a.val - b.val);
+                const sameSuit = bot.hand.filter(c => c.symbol === leadSuit).sort((a, b) => a.val - b.val);
 
                 if (sameSuit.length > 0) {
-                    // Bot has the lead suit — decide whether to win or lose
                     const currentHigh = [...room.table]
                         .filter(c => c.symbol === leadSuit)
                         .sort((a, b) => b.val - a.val)[0];
 
-                    // Check if any player AFTER bot in this trick is void in lead suit
-                    // (they will cut/dump danger cards onto the trick winner)
-                    const playersYetToPlay = getPlayersYetToAct(room, botId, leadSuit);
-                    const anyVoidAhead = playersYetToPlay.some(pid => {
-                        const missing = room.missingCards[pid] || [];
-                        return missing.includes(leadSuit);
-                    });
-
-                    // Check if there are already danger cards (high value) on the table
-                    const maxTableVal = Math.max(...room.table.map(c => c.val));
-                    const trickIsDangerous = maxTableVal >= 13;
-
-                    if (anyVoidAhead || trickIsDangerous) {
-                        // Unsafe to win: play lowest card (intentionally lose or minimise)
+                    if (room.loadedPlayerId === botId && room.lastRoundType === 'cut') {
                         cardToPlay = sameSuit[0];
                     } else {
-                        // Safe to win: play smallest winning card, else smallest losing card
-                        const smallestWin = sameSuit.find(c => c.val > currentHigh.val);
-                        cardToPlay = smallestWin || sameSuit[0];
+                        cardToPlay = sameSuit.find(c => c.val > currentHigh.val) || sameSuit[0];
                     }
                 } else {
-                    // Bot is void in lead suit — must cut/dump
                     rememberMissingSuit(room, botId, leadSuit);
-
-                    // Dump highest value card to clear danger from own hand
                     cardToPlay = [...bot.hand].sort((a, b) => b.val - a.val)[0];
                 }
             }
 
             if (cardToPlay) handleMove(roomId, botId, cardToPlay);
         }, 1500);
-    }
-
-    // ── Helper: get player IDs that haven't played yet in current trick ──
-    function getPlayersYetToAct(room, botId, leadSuit) {
-        const playedIds = new Set(room.table.map(c => c.playedBy));
-        const turnOrder = room.players.map(p => p.id);
-        const botIdx = turnOrder.indexOf(botId);
-        const result = [];
-
-        for (let i = 1; i < turnOrder.length; i++) {
-            const pid = turnOrder[(botIdx + i) % turnOrder.length];
-            const p = room.players.find(pl => pl.id === pid);
-            const isWinner = room.winners.some(w => w.id === pid);
-            const hasCards = (p?.hand?.length ?? 0) > 0;
-            if (!playedIds.has(pid) && !isWinner && hasCards) {
-                result.push(pid);
-            }
-        }
-
-        return result;
     }
 
     // --- 🚨 NEW: CONNECTION TRACKING LOGIC ---
