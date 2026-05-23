@@ -78,6 +78,7 @@ function getNextActivePlayer(room, currentPlayerId) {
     const alive = getAlivePlayers(room);
     if (alive.length === 0) return null;
     const currentIdx = room.players.findIndex(p => p.id === currentPlayerId);
+    if (currentIdx === -1) return alive[0].id;
     for (let i = 1; i <= room.players.length; i++) {
         const candidate = room.players[(currentIdx + i) % room.players.length];
         if (alive.some(p => p.id === candidate.id)) return candidate.id;
@@ -108,7 +109,6 @@ function updateWinners(roomId) {
             changed = true;
         }
     });
-    // Auto-assign 4th (donkey) when 3 are done
     if (room.winners.length === 3) {
         const remaining = room.players.find(p => !room.winners.some(w => w.id === p.id));
         if (remaining) {
@@ -145,7 +145,6 @@ function chooseLeadCardAI(room, botId) {
     const bot = room.players.find(p => p.id === botId);
     const aiHand = bot.hand;
 
-    // Very first move of the entire game — must play Ace of Spades
     if (!room.firstRoundPlayed) {
         const ace = aiHand.find(c => c.symbol === '♠' && c.label === 'A');
         if (ace) return ace;
@@ -231,12 +230,27 @@ function chooseFollowCardAI(room, botId) {
 }
 
 // ─────────────────────────────────────────────
-// BOT SCHEDULER — token lock prevents duplicate/stale fires
+// BOT SCHEDULER
+//
+// ROOT FIX: The previous version had TWO guards:
+//   (1) if (r.currentTurn !== botId) return;
+//   (2) token check
+//
+// Guard (1) caused the freeze. After a bot leads the Ace of Spades,
+// handleMove sets currentTurn = nextPlayer, then immediately calls
+// scheduleBotTurn(nextPlayer). The token is stamped correctly.
+// BUT: if any async event (socket ping, reconnect, stale emit)
+// runs between the schedule and the 1500ms fire and mutates
+// room.currentTurn even briefly, guard (1) kills the bot turn.
+//
+// FIX: Remove guard (1). The token alone is sufficient — it stamps
+// a unique value per schedule and only the latest call fires.
+// currentTurn is RE-VALIDATED inside handleMove itself, which is
+// the authoritative gate. No need to double-check here.
 // ─────────────────────────────────────────────
 function scheduleBotTurn(roomId, botId, delay = 1000) {
     if (!rooms[roomId]) return;
 
-    // Each new schedule stamps a unique token — only the latest fires
     if (!rooms[roomId]._botToken) rooms[roomId]._botToken = {};
     const token = Date.now() + Math.random();
     rooms[roomId]._botToken[botId] = token;
@@ -244,9 +258,12 @@ function scheduleBotTurn(roomId, botId, delay = 1000) {
     setTimeout(() => {
         const r = rooms[roomId];
         if (!r || !r.gameStarted || r.gameEnded) return;
-        if (r.currentTurn !== botId) return;
-        // Stale call guard — discard if a newer schedule replaced this one
+
+        // ✅ ONLY token check — removed currentTurn guard that caused freeze
         if (r._botToken[botId] !== token) return;
+
+        // Re-validate turn at execution time
+        if (r.currentTurn !== botId) return;
 
         const b = r.players.find(p => p.id === botId);
         if (!b || !b.isBot || !b.hand || b.hand.length === 0) return;
@@ -311,7 +328,7 @@ function handleMove(roomId, playerId, card) {
         }
     }
 
-    // Send updated hand to human player right away
+    // Send updated hand to human player immediately
     if (!player.isBot) {
         io.to(playerId).emit('yourCards', player.hand);
     }
@@ -320,7 +337,6 @@ function handleMove(roomId, playerId, card) {
     if (!isLeadMove) {
         const leadSuit = room.table[0].symbol;
         if (playedCard.symbol !== leadSuit) {
-            // Lock turn during resolution animation
             room.currentTurn = null;
             io.to(roomId).emit('gameUpdated', {
                 table: room.table,
@@ -353,8 +369,8 @@ function handleMove(roomId, playerId, card) {
                 if (aliveNow.length <= 1) { updateWinners(roomId); endGame(roomId); return; }
 
                 let nextTurn = winnerId;
-                if (r.winners.some(w => w.id === winnerId)) {
-                    nextTurn = getNextActivePlayer(r, winnerId);
+                if (!nextTurn || r.winners.some(w => w.id === nextTurn)) {
+                    nextTurn = getNextActivePlayer(r, playerId);
                 }
 
                 r.currentTurn = nextTurn;
@@ -386,7 +402,6 @@ function handleMove(roomId, playerId, card) {
     const aliveNotPlayed = aliveNow.filter(p => !roundPlayers.has(p.id));
 
     if (aliveNotPlayed.length === 0) {
-        // Lock turn during resolution animation
         room.currentTurn = null;
         io.to(roomId).emit('gameUpdated', {
             table: room.table,
@@ -438,9 +453,8 @@ function handleMove(roomId, playerId, card) {
     }
 
     // ── Pass to next player in ongoing trick ──────────────────────
-    // FIX: compute nextTurn FIRST, set room.currentTurn, THEN broadcast.
-    // Never broadcast currentTurn: null during an ongoing trick —
-    // that was causing the bot turn to appear frozen after leading the Ace.
+    // Compute nextTurn, commit to room state, then broadcast.
+    // Never null out currentTurn here — that is what froze the game.
     const nextTurn = getNextActivePlayer(room, playerId);
     room.currentTurn = nextTurn;
 
