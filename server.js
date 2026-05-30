@@ -47,16 +47,13 @@ const sortHandBySuitAndValue = (hand) => {
 let rooms = {};
 
 // ─────────────────────────────────────────────
-// HELPERS
+// HELPERS (module-level, not inside socket handler)
 // ─────────────────────────────────────────────
 
-/**
- * FIX (Bug 1): getNextPlayer now accepts an optional `skipSet` — a Set of
- * playerIds who have already played in the current trick. This prevents the
- * function from accidentally cycling back to a player (including a bot) who
- * has already placed a card this trick.
- */
-function getNextPlayer(room, currentPlayerId, skipSet = null) {
+// FIX 1: Added optional alreadyPlayedSet parameter.
+// When called mid-trick, pass the set of playerIds who already placed a card
+// so the function never loops back to them. All other logic unchanged.
+function getNextPlayer(room, currentPlayerId, alreadyPlayedSet = null) {
     if (!room || !room.players.length) return null;
     const playerIndex = room.players.findIndex(p => p.id === currentPlayerId);
     if (playerIndex === -1) return null;
@@ -64,8 +61,8 @@ function getNextPlayer(room, currentPlayerId, skipSet = null) {
         const next = room.players[(playerIndex + i) % room.players.length];
         const isWinner = room.winners.some(w => w.id === next.id);
         const hasCards = (next.hand?.length ?? 0) > 0;
-        // If skipSet provided, also skip players who already played this trick
-        const alreadyPlayed = skipSet ? skipSet.has(next.id) : false;
+        // NEW: skip players who already played this trick
+        const alreadyPlayed = alreadyPlayedSet ? alreadyPlayedSet.has(next.id) : false;
         if (next && hasCards && !isWinner && !alreadyPlayed) return next.id;
     }
     return null;
@@ -142,11 +139,13 @@ function updateWinners(roomId) {
 
 // ─────────────────────────────────────────────
 // MASTERMIND AI LEAD LOGIC
+// Checks ALL alive opponents for void suits — not just next player.
 // ─────────────────────────────────────────────
 function chooseLeadCard(room, botId) {
     const bot = room.players.find(p => p.id === botId);
     const aiHand = bot.hand;
 
+    // Must lead Ace of Spades on very first move
     if (room.discardedPile.length === 0 && room.table.length === 0) {
         const aceSpade = aiHand.find(c => c.symbol === '♠' && c.label === 'A');
         if (aceSpade) return aceSpade;
@@ -158,6 +157,7 @@ function chooseLeadCard(room, botId) {
         p.hand && p.hand.length > 0
     );
 
+    // Count how many alive opponents are void in each suit
     const voidCountBySuit = {};
     aliveOpponents.forEach(opp => {
         const missing = room.missingCards[opp.id] || [];
@@ -174,17 +174,27 @@ function chooseLeadCard(room, botId) {
         let score = 0;
         const voidOpponents = voidCountBySuit[card.symbol] || 0;
 
+        // Heavy penalty per void opponent — core safety rule
         score -= voidOpponents * 40;
+
+        // Bonus for suits where NO opponent is void
         if (voidOpponents === 0) score += 25;
+
+        // Prefer lower value cards as lead
         score += (15 - card.val) * 1.5;
+
+        // Penalty for high-value cards (Ace, King) as lead
         if (card.val >= 14) score -= 20;
         if (card.val === 13) score -= 12;
 
+        // Penalty for repeating recently led suits
         const repetition = recentLeads.filter(s => s === card.symbol).length;
         score -= repetition * 10;
 
+        // Bonus for suit density (maintain control)
         const sameSuitCount = aiHand.filter(c => c.symbol === card.symbol).length;
         score += sameSuitCount * 3;
+
         if (voidOpponents === 0 && sameSuitCount >= 3) score += 12;
 
         if (score > bestScore) { bestScore = score; bestCard = card; }
@@ -195,6 +205,7 @@ function chooseLeadCard(room, botId) {
 
 // ─────────────────────────────────────────────
 // MASTERMIND AI FOLLOW LOGIC
+// Avoids winning risky tricks; dumps danger cards when void.
 // ─────────────────────────────────────────────
 function chooseFollowCard(room, botId) {
     const bot = room.players.find(p => p.id === botId);
@@ -212,6 +223,7 @@ function chooseFollowCard(room, botId) {
         const winningCards = sameSuit.filter(c => c.val > currentHighVal);
         const losingCards = sameSuit.filter(c => c.val <= currentHighVal);
 
+        // Detect future void players who haven't played yet this trick
         const roundPlayedBy = new Set(room.table.map(c => c.playedBy));
         const remainingAlive = room.players.filter(p =>
             !roundPlayedBy.has(p.id) &&
@@ -227,23 +239,27 @@ function chooseFollowCard(room, botId) {
         const trickIsRisky = futureVoidCount > 0 || dangerAlreadyOnTable > 0;
 
         if (trickIsRisky) {
+            // Try to lose intentionally — play highest card that still loses
             if (losingCards.length > 0) return losingCards[losingCards.length - 1];
+            // Forced to win — play smallest winner to minimize future risk
             if (winningCards.length > 0) return winningCards[0];
             return sameSuit[0];
         }
 
+        // Safe trick — win cheaply
         if (winningCards.length > 0) return winningCards[0];
         return sameSuit[0];
     }
 
+    // Void in lead suit — dump highest value card (discard danger)
     rememberMissingSuit(room, botId, leadSuit);
     return [...aiHand].sort((a, b) => b.val - a.val)[0];
 }
 
 // ─────────────────────────────────────────────
-// BOT SCHEDULER
-// FIX (Bug 1): Token validation is now stricter — we also verify the bot
-// hasn't already placed a card in the current trick (via room.table check).
+// BOT SCHEDULER — token lock prevents stale/duplicate fires
+// Token is the ONLY guard. currentTurn is re-validated inside
+// handleMove, which is the authoritative gate.
 // ─────────────────────────────────────────────
 function scheduleBotTurn(roomId, botId, delay = 1500) {
     if (!rooms[roomId]) return;
@@ -254,21 +270,17 @@ function scheduleBotTurn(roomId, botId, delay = 1500) {
     setTimeout(() => {
         const r = rooms[roomId];
         if (!r || !r.gameStarted) return;
-        // Token guard — discard stale schedules
+        // Discard if a newer schedule replaced this one
         if (r._botToken[botId] !== token) return;
-        // Turn guard — bot must still be the current turn
+        // Re-validate: bot must still be the current turn
         if (r.currentTurn !== botId) return;
 
         const b = r.players.find(p => p.id === botId);
         if (!b || !b.isBot || !b.hand || b.hand.length === 0) return;
         if (r.winners.some(w => w.id === botId)) return;
 
-        // FIX (Bug 1): Extra guard — if bot already played in this trick, do NOT play again
-        const alreadyPlayedThisTrick = r.table.some(c => c.playedBy === botId);
-        if (alreadyPlayedThisTrick) {
-            console.log(`Bot ${botId} already played this trick — skipping scheduled turn`);
-            return;
-        }
+        // FIX 1: Extra guard — bot must not have already played this trick
+        if (r.table.some(c => c.playedBy === botId)) return;
 
         let cardToPlay;
         try {
@@ -292,8 +304,6 @@ function scheduleBotTurn(roomId, botId, delay = 1500) {
 
 // ─────────────────────────────────────────────
 // CORE MOVE HANDLER
-// FIX (Bug 1): Pass the current trick's played-by set to getNextPlayer so
-// the next-turn calculation never loops back to a bot who already played.
 // ─────────────────────────────────────────────
 function handleMove(roomId, playerId, card) {
     const room = rooms[roomId];
@@ -306,15 +316,12 @@ function handleMove(roomId, playerId, card) {
     if (!player) return;
     if (room.winners.some(w => w.id === playerId)) return;
 
-    // FIX (Bug 1): Prevent a player from playing twice in the same trick
-    const alreadyPlayedThisTrick = room.table.some(c => c.playedBy === playerId);
-    if (alreadyPlayedThisTrick) {
-        console.log(`Player ${playerId} already played this trick — ignoring duplicate move`);
-        return;
-    }
+    // FIX 1: Prevent duplicate play in same trick
+    if (room.table.some(c => c.playedBy === playerId)) return;
 
     const cardInHand = player.hand.find(c => c.id === card.id);
     if (!cardInHand) {
+        // Stale card reference (bot) — play any card
         if (player.isBot && player.hand.length > 0) {
             return handleMove(roomId, playerId, player.hand[0]);
         }
@@ -374,8 +381,9 @@ function handleMove(roomId, playerId, card) {
                 r.lastRoundType = 'cut';
 
                 updateWinners(roomId);
-                if (!r.gameStarted) return;
+                if (!r.gameStarted) return; // game ended
 
+                // Winner who collected must lead next
                 let nextTurn = loadedPlayerId;
                 if (!nextTurn || r.winners.some(w => w.id === nextTurn)) {
                     nextTurn = getNextPlayer(r, playerId);
@@ -433,7 +441,7 @@ function handleMove(roomId, playerId, card) {
             r.lastRoundType = 'normal';
 
             updateWinners(roomId);
-            if (!r.gameStarted) return;
+            if (!r.gameStarted) return; // game ended
 
             let nextStarter = getNextStarterFromTable(r, trickSnapshot, leadSuit);
             if (!nextStarter || r.winners.some(w => w.id === nextStarter)) {
@@ -458,8 +466,7 @@ function handleMove(roomId, playerId, card) {
     }
 
     // ── Pass turn to next player in ongoing trick ─────────────────
-    // FIX (Bug 1): Pass roundPlayers (already-played set) so getNextPlayer
-    // never selects someone who already placed a card this trick.
+    // FIX 1: Pass roundPlayers so getNextPlayer skips already-played players
     const nextTurnId = getNextPlayer(room, playerId, roundPlayers);
     if (!nextTurnId) {
         updateWinners(roomId);
@@ -546,9 +553,6 @@ io.on("connection", (socket) => {
         });
     });
 
-    // FIX (Bug 2): returnToLobby now keeps all real (non-bot) players in the
-    // room, resets game state, and broadcasts the updated lobby so everyone
-    // sees the same room code and player list — no one is sent to the home screen.
     socket.on("returnToLobby", ({ roomId }) => {
         const room = rooms[roomId];
         if (!room) return;
@@ -557,16 +561,12 @@ io.on("connection", (socket) => {
         room.missingCards = {}; room.recentLeadSuits = [];
         room.loadedPlayerId = null; room.lastRoundType = null;
         room.currentTurn = null; room._botToken = {};
-        // Keep real players only; reset their hands
         room.players = room.players
             .filter(p => !p.isBot)
             .map((p, i) => ({ ...p, host: i === 0 ? true : p.host, hand: [], handCount: 0 }));
         io.to(roomId).emit("playersUpdated", room.players.map(({ hand, ...rest }) => rest));
-        // Emit roomState so ALL clients in the room switch back to lobby view
-        io.to(roomId).emit("roomState", {
-            roomId,
-            players: room.players.map(({ hand, ...rest }) => rest)
-        });
+        // FIX 2: broadcast roomState to ALL players so everyone returns to lobby
+        io.to(roomId).emit("roomState", { roomId, players: room.players.map(({ hand, ...rest }) => rest) });
     });
 
     socket.on("removePlayer", ({ roomId, targetPlayerId }, callback) => {
