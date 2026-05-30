@@ -710,6 +710,12 @@ io.on("connection", (socket) => {
             return callback?.({ success: false, message: "Not your turn" });
         }
 
+        if (room.discardedPile.length === 0 && room.table.length === 0) {
+            if (!(card.symbol === '♠' && card.label === 'A')) {
+                return callback?.({ success: false, message: "First move must be Ace of Spades" });
+            }
+        }
+
         if (room.table.length > 0) {
             const player = room.players.find(p => p.id === socket.id);
             if (player) {
