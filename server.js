@@ -49,11 +49,7 @@ let rooms = {};
 // ─────────────────────────────────────────────
 // HELPERS (module-level, not inside socket handler)
 // ─────────────────────────────────────────────
-
-// FIX 1: Added optional alreadyPlayedSet parameter.
-// When called mid-trick, pass the set of playerIds who already placed a card
-// so the function never loops back to them. All other logic unchanged.
-function getNextPlayer(room, currentPlayerId, alreadyPlayedSet = null) {
+function getNextPlayer(room, currentPlayerId) {
     if (!room || !room.players.length) return null;
     const playerIndex = room.players.findIndex(p => p.id === currentPlayerId);
     if (playerIndex === -1) return null;
@@ -61,9 +57,7 @@ function getNextPlayer(room, currentPlayerId, alreadyPlayedSet = null) {
         const next = room.players[(playerIndex + i) % room.players.length];
         const isWinner = room.winners.some(w => w.id === next.id);
         const hasCards = (next.hand?.length ?? 0) > 0;
-        // NEW: skip players who already played this trick
-        const alreadyPlayed = alreadyPlayedSet ? alreadyPlayedSet.has(next.id) : false;
-        if (next && hasCards && !isWinner && !alreadyPlayed) return next.id;
+        if (next && hasCards && !isWinner) return next.id;
     }
     return null;
 }
@@ -279,9 +273,6 @@ function scheduleBotTurn(roomId, botId, delay = 1500) {
         if (!b || !b.isBot || !b.hand || b.hand.length === 0) return;
         if (r.winners.some(w => w.id === botId)) return;
 
-        // FIX 1: Extra guard — bot must not have already played this trick
-        if (r.table.some(c => c.playedBy === botId)) return;
-
         let cardToPlay;
         try {
             if (r.table.length === 0) {
@@ -315,9 +306,6 @@ function handleMove(roomId, playerId, card) {
     const player = room.players.find(p => p.id === playerId);
     if (!player) return;
     if (room.winners.some(w => w.id === playerId)) return;
-
-    // FIX 1: Prevent duplicate play in same trick
-    if (room.table.some(c => c.playedBy === playerId)) return;
 
     const cardInHand = player.hand.find(c => c.id === card.id);
     if (!cardInHand) {
@@ -466,8 +454,7 @@ function handleMove(roomId, playerId, card) {
     }
 
     // ── Pass turn to next player in ongoing trick ─────────────────
-    // FIX 1: Pass roundPlayers so getNextPlayer skips already-played players
-    const nextTurnId = getNextPlayer(room, playerId, roundPlayers);
+    const nextTurnId = getNextPlayer(room, playerId);
     if (!nextTurnId) {
         updateWinners(roomId);
         return;
@@ -565,7 +552,6 @@ io.on("connection", (socket) => {
             .filter(p => !p.isBot)
             .map((p, i) => ({ ...p, host: i === 0 ? true : p.host, hand: [], handCount: 0 }));
         io.to(roomId).emit("playersUpdated", room.players.map(({ hand, ...rest }) => rest));
-        // FIX 2: broadcast roomState to ALL players so everyone returns to lobby
         io.to(roomId).emit("roomState", { roomId, players: room.players.map(({ hand, ...rest }) => rest) });
     });
 
