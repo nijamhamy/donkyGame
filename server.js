@@ -143,6 +143,23 @@ function ensureTurnProgress(roomId, anchorId) {
         !room.winners.some(w => w.id === room.currentTurn) &&
         room.players.find(p => p.id === room.currentTurn && p.hand && p.hand.length > 0);
 
+    // ✅ FIX: even when currentTurn *looks* valid (real bot, has cards, not
+    // ranked out), verify a timer is actually armed and not yet overdue.
+    // A race between overlapping scheduleBotTurn/ensureTurnProgress calls
+    // can invalidate a token before its timer ever fires, leaving a
+    // "correct" currentTurn with nothing behind it — the exact bug where a
+    // bot's turn just sits forever with an empty table. Anything overdue
+    // by more than a small grace window is treated as dead and re-armed.
+    if (currentIsValid && room.currentTurn.startsWith('bot-')) {
+        const armed = room._armedBotTimer?.[room.currentTurn];
+        const tokenMatches = armed && room._botToken?.[room.currentTurn] === armed.token;
+        const overdue = !armed || armed.fired || (armed.dueAt + 1000 < Date.now());
+        if (!tokenMatches || overdue) {
+            scheduleBotTurn(roomId, room.currentTurn, 300);
+            return;
+        }
+    }
+
     if (currentIsValid) return;
 
     const fixedTurn = resolveValidTurn(room, room.currentTurn, anchorId);
@@ -164,6 +181,29 @@ function ensureTurnProgress(roomId, anchorId) {
         armHumanTurnWatchdog(roomId, fixedTurn);
         resendHandToPlayer(roomId, fixedTurn);
     }
+}
+
+// ✅ FIX: periodic liveness sweep, one per room, running for the lifetime
+// of an active game. This is what actually guarantees "never stuck
+// forever" for the bot-timer-race case above — ensureTurnProgress is only
+// ever called reactively from specific code paths, so if some future edge
+// case invalidates a bot timer from a path that doesn't call it, the room
+// would still hang. This sweep calls the same check unconditionally every
+// 2 seconds, so any dead timer gets caught within ~2s no matter how it
+// happened. It does not touch cards, scores, or turn order — it only
+// re-arms execution when it detects nothing is actually scheduled.
+function startRoomWatchdogSweep(roomId) {
+    const room = rooms[roomId];
+    if (!room) return;
+    if (room._sweepInterval) clearInterval(room._sweepInterval);
+    room._sweepInterval = setInterval(() => {
+        const r = rooms[roomId];
+        if (!r || !r.gameStarted) {
+            clearInterval(room._sweepInterval);
+            return;
+        }
+        ensureTurnProgress(roomId, r.currentTurn);
+    }, 2000);
 }
 
 // ✅ FIX (root cause mitigation, server side): Previously, only bots had any
@@ -233,6 +273,9 @@ function updateWinners(roomId) {
         }
         room.gameStarted = false;
         room.currentTurn = null;
+        // ✅ FIX: stop the periodic sweep once the game has actually ended —
+        // it would otherwise keep polling a finished room every 2s forever.
+        if (room._sweepInterval) { clearInterval(room._sweepInterval); room._sweepInterval = null; }
         io.to(roomId).emit('winnersUpdated', room.winners);
         io.to(roomId).emit('gameFinished', {
             winners: room.winners,
@@ -385,11 +428,27 @@ function scheduleBotTurn(roomId, botId, delay = 1500) {
     const token = Date.now() + Math.random();
     rooms[roomId]._botToken[botId] = token;
 
+    // ✅ FIX: record that a timer is now "armed" for this specific
+    // (roomId, botId, token) so ensureTurnProgress and a periodic
+    // liveness sweep can tell the difference between "currentTurn is a
+    // valid bot" and "currentTurn is a valid bot AND a timer is actually
+    // going to fire for it". Previously multiple call sites could each
+    // invalidate each other's token in a race (ensureTurnProgress after a
+    // strike/round resolution overlapping with an earlier re-arm), leaving
+    // currentTurn correct but zero live timers behind it — the bot would
+    // then never act and the whole table would hang, exactly matching the
+    // "Bot 3 not playing while a human waits" symptom.
+    if (!rooms[roomId]._armedBotTimer) rooms[roomId]._armedBotTimer = {};
+    rooms[roomId]._armedBotTimer[botId] = { token, dueAt: Date.now() + delay, fired: false };
+
     setTimeout(() => {
         const r = rooms[roomId];
         if (!r || !r.gameStarted) return;
         // Discard if a newer schedule replaced this one
         if (r._botToken[botId] !== token) return;
+        if (r._armedBotTimer?.[botId]?.token === token) {
+            r._armedBotTimer[botId].fired = true;
+        }
         // Re-validate: bot must still be the current turn
         if (r.currentTurn !== botId) return;
 
@@ -734,6 +793,7 @@ io.on("connection", (socket) => {
         room.missingCards = {}; room.recentLeadSuits = [];
         room.loadedPlayerId = null; room.lastRoundType = null;
         room.currentTurn = null; room._botToken = {};
+        if (room._sweepInterval) { clearInterval(room._sweepInterval); room._sweepInterval = null; }
         room.players = room.players
             .filter(p => !p.isBot)
             .map((p, i) => ({ ...p, host: i === 0 ? true : p.host, hand: [], handCount: 0 }));
@@ -803,6 +863,11 @@ io.on("connection", (socket) => {
         // ✅ FIX: safety net right after deal in case starter resolution
         // ever ends up pointing at an invalid player (e.g., future rule change).
         setTimeout(() => ensureTurnProgress(roomId, room.currentTurn), 2500);
+
+        // ✅ FIX: start the periodic sweep for the whole game, so any bot
+        // timer that dies from a race (see startRoomWatchdogSweep) is
+        // always caught within ~2s, not just at specific reactive checkpoints.
+        startRoomWatchdogSweep(roomId);
     });
 
     socket.on("requestMyCards", ({ roomId }) => {
