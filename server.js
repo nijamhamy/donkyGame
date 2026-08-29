@@ -157,6 +157,55 @@ function ensureTurnProgress(roomId, anchorId) {
 
     if (fixedTurn.startsWith('bot-')) {
         scheduleBotTurn(roomId, fixedTurn, 800);
+    } else {
+        // ✅ FIX: also re-arm the human watchdog for the newly assigned turn,
+        // and proactively resend their hand in case the client's copy is
+        // out of sync (see onYourCards race in the client for context).
+        armHumanTurnWatchdog(roomId, fixedTurn);
+        resendHandToPlayer(roomId, fixedTurn);
+    }
+}
+
+// ✅ FIX (root cause mitigation, server side): Previously, only bots had any
+// mechanism to recover from a stuck turn (scheduleBotTurn + ensureTurnProgress).
+// A human whose client never rendered their dealt hand (due to the client-side
+// race described in MultiplayerGame.jsx) had NO way to ever act, and the server
+// had no timeout — so the entire table would hang forever waiting for a
+// playCard event that could never arrive. This resends the current turn
+// player's authoritative hand a couple of times as a passive nudge; it does
+// NOT change whose turn it is, does NOT change any cards, and does NOT
+// auto-play on behalf of a human — it only guarantees the client has every
+// opportunity to resync its rendered hand with what the server already holds.
+const _humanWatchdogTokens = {};
+function armHumanTurnWatchdog(roomId, playerId) {
+    if (!playerId || playerId.startsWith('bot-')) return;
+    if (!_humanWatchdogTokens[roomId]) _humanWatchdogTokens[roomId] = {};
+    const token = Date.now() + Math.random();
+    _humanWatchdogTokens[roomId][playerId] = token;
+
+    const nudge = (delay) => {
+        setTimeout(() => {
+            const room = rooms[roomId];
+            if (!room || !room.gameStarted) return;
+            if (_humanWatchdogTokens[roomId]?.[playerId] !== token) return; // superseded
+            if (room.currentTurn !== playerId) return; // turn already moved on, nothing to do
+            resendHandToPlayer(roomId, playerId);
+        }, delay);
+    };
+
+    // Two gentle nudges. If the player's client was simply mid-race, the
+    // first requestMyCards/yourCards round trip (client-side fix) resolves
+    // it well before this ever fires. This is a pure safety net.
+    nudge(4000);
+    nudge(9000);
+}
+
+function resendHandToPlayer(roomId, playerId) {
+    const room = rooms[roomId];
+    if (!room) return;
+    const player = room.players.find(p => p.id === playerId);
+    if (player && !player.isBot && player.hand && player.hand.length > 0) {
+        io.to(playerId).emit('yourCards', player.hand);
     }
 }
 
@@ -500,6 +549,10 @@ function handleMove(roomId, playerId, card) {
 
                 if (nextTurn && nextTurn.startsWith('bot-')) {
                     scheduleBotTurn(roomId, nextTurn, 1500);
+                } else if (nextTurn) {
+                    // ✅ FIX: arm the same stuck-human safety net used elsewhere
+                    // whenever a human is handed the next turn after a cut.
+                    armHumanTurnWatchdog(roomId, nextTurn);
                 }
 
                 // ✅ FIX: watchdog pass in case nextTurn still somehow invalid
@@ -565,6 +618,10 @@ function handleMove(roomId, playerId, card) {
 
             if (nextStarter && nextStarter.startsWith('bot-')) {
                 scheduleBotTurn(roomId, nextStarter, 1500);
+            } else if (nextStarter) {
+                // ✅ FIX: arm the same stuck-human safety net used elsewhere
+                // whenever a human is handed the next lead after a normal trick.
+                armHumanTurnWatchdog(roomId, nextStarter);
             }
 
             // ✅ FIX: watchdog pass in case nextStarter still somehow invalid
@@ -594,6 +651,10 @@ function handleMove(roomId, playerId, card) {
 
     if (nextTurnId.startsWith('bot-')) {
         scheduleBotTurn(roomId, nextTurnId, 1500);
+    } else {
+        // ✅ FIX: arm the same stuck-human safety net used elsewhere whenever
+        // a human is handed the next turn mid-trick.
+        armHumanTurnWatchdog(roomId, nextTurnId);
     }
 }
 
@@ -704,6 +765,7 @@ io.on("connection", (socket) => {
         room.missingCards = {}; room.recentLeadSuits = [];
         room.loadedPlayerId = null; room.lastRoundType = null;
         room.currentTurn = null; room._botToken = {};
+        _humanWatchdogTokens[roomId] = {};
 
         while (room.players.length < 4) {
             const botId = `bot-${Math.random().toString(36).substr(2, 5)}`;
@@ -731,6 +793,11 @@ io.on("connection", (socket) => {
 
         if (room.currentTurn && room.currentTurn.startsWith('bot-')) {
             scheduleBotTurn(roomId, room.currentTurn, 1500);
+        } else if (room.currentTurn) {
+            // ✅ FIX: arm the stuck-human safety net for the very first turn
+            // of the match too — this is exactly the scenario in the bug
+            // report ("it becomes a player's turn" right after dealing).
+            armHumanTurnWatchdog(roomId, room.currentTurn);
         }
 
         // ✅ FIX: safety net right after deal in case starter resolution
