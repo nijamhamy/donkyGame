@@ -99,6 +99,67 @@ function getAlivePlayers(room) {
     );
 }
 
+// ✅ FIX: module-level, order-preserving "who should act next" resolver.
+// Mirrors Game.jsx's getNextActivePlayer guarantee: given ANY candidate
+// (which might be null, ranked, or out of cards), always fall back to
+// scanning the alive-players list in turn order so we never get stuck.
+function resolveValidTurn(room, preferredId, fallbackAnchorId) {
+    const alive = getAlivePlayers(room);
+    if (alive.length === 0) return null;
+
+    const isValid = (id) => {
+        if (!id) return false;
+        if (room.winners.some(w => w.id === id)) return false;
+        const p = room.players.find(pl => pl.id === id);
+        return !!(p && p.hand && p.hand.length > 0);
+    };
+
+    if (isValid(preferredId)) return preferredId;
+
+    // Try to walk forward from the anchor (last actor) in table order
+    if (fallbackAnchorId) {
+        const next = getNextPlayer(room, fallbackAnchorId);
+        if (isValid(next)) return next;
+    }
+
+    // Last resort: first alive player in seating order
+    return alive[0].id;
+}
+
+// ✅ FIX: watchdog — after every resolution, verify currentTurn is a real,
+// alive, non-ranked player. If not, recompute it and, if it's a bot,
+// re-arm the bot scheduler. This is the safety net Game.jsx effectively
+// gets for free client-side via getAlivePlayers/getNextActivePlayer chains;
+// the server previously had no equivalent guarantee.
+function ensureTurnProgress(roomId, anchorId) {
+    const room = rooms[roomId];
+    if (!room || !room.gameStarted) return;
+
+    const alive = getAlivePlayers(room);
+    if (alive.length === 0) return; // nothing to do, game should be finishing via updateWinners
+
+    const currentIsValid =
+        room.currentTurn &&
+        !room.winners.some(w => w.id === room.currentTurn) &&
+        room.players.find(p => p.id === room.currentTurn && p.hand && p.hand.length > 0);
+
+    if (currentIsValid) return;
+
+    const fixedTurn = resolveValidTurn(room, room.currentTurn, anchorId);
+    if (!fixedTurn) return;
+
+    room.currentTurn = fixedTurn;
+    io.to(roomId).emit('gameUpdated', {
+        table: room.table,
+        currentTurn: fixedTurn,
+        players: room.players.map(({ hand, ...rest }) => rest)
+    });
+
+    if (fixedTurn.startsWith('bot-')) {
+        scheduleBotTurn(roomId, fixedTurn, 800);
+    }
+}
+
 function updateWinners(roomId) {
     const room = rooms[roomId];
     if (!room) return;
@@ -137,6 +198,7 @@ function updateWinners(roomId) {
 // ─────────────────────────────────────────────
 function chooseLeadCard(room, botId) {
     const bot = room.players.find(p => p.id === botId);
+    if (!bot || !bot.hand || bot.hand.length === 0) return null;
     const aiHand = bot.hand;
 
     // Must lead Ace of Spades on very first move
@@ -203,7 +265,15 @@ function chooseLeadCard(room, botId) {
 // ─────────────────────────────────────────────
 function chooseFollowCard(room, botId) {
     const bot = room.players.find(p => p.id === botId);
+    if (!bot || !bot.hand || bot.hand.length === 0) return null;
     const aiHand = bot.hand;
+
+    // ✅ FIX: guard against a transiently empty/stale table (race between
+    // trick resolution clearing room.table and a queued bot timer firing).
+    if (!room.table || room.table.length === 0) {
+        return chooseLeadCard(room, botId);
+    }
+
     const leadSuit = room.table[0].symbol;
 
     const sameSuit = aiHand.filter(c => c.symbol === leadSuit).sort((a, b) => a.val - b.val);
@@ -254,6 +324,11 @@ function chooseFollowCard(room, botId) {
 // BOT SCHEDULER — token lock prevents stale/duplicate fires
 // Token is the ONLY guard. currentTurn is re-validated inside
 // handleMove, which is the authoritative gate.
+// ✅ FIX: guaranteed fallback so a bot NEVER silently fails to act —
+// if hand is transiently empty (race with updateWinners) we do one
+// cheap re-check shortly after instead of dying silently; if a card
+// still can't be resolved we hand off via ensureTurnProgress instead
+// of leaving the room frozen.
 // ─────────────────────────────────────────────
 function scheduleBotTurn(roomId, botId, delay = 1500) {
     if (!rooms[roomId]) return;
@@ -270,8 +345,30 @@ function scheduleBotTurn(roomId, botId, delay = 1500) {
         if (r.currentTurn !== botId) return;
 
         const b = r.players.find(p => p.id === botId);
-        if (!b || !b.isBot || !b.hand || b.hand.length === 0) return;
-        if (r.winners.some(w => w.id === botId)) return;
+        if (!b || !b.isBot) return;
+
+        if (!b.hand || b.hand.length === 0) {
+            // ✅ FIX: transient race (e.g., winners just updated) — retry once
+            // shortly instead of abandoning the bot's turn forever. If the
+            // bot is genuinely out of cards, updateWinners/ensureTurnProgress
+            // will move the turn on when this fires again and finds nothing.
+            if (r.winners.some(w => w.id === botId)) {
+                ensureTurnProgress(roomId, botId);
+                return;
+            }
+            setTimeout(() => {
+                const r2 = rooms[roomId];
+                if (!r2 || !r2.gameStarted) return;
+                if (r2._botToken[botId] !== token) return;
+                if (r2.currentTurn !== botId) return;
+                ensureTurnProgress(roomId, botId);
+            }, 400);
+            return;
+        }
+        if (r.winners.some(w => w.id === botId)) {
+            ensureTurnProgress(roomId, botId);
+            return;
+        }
 
         let cardToPlay;
         try {
@@ -282,13 +379,20 @@ function scheduleBotTurn(roomId, botId, delay = 1500) {
             }
         } catch (e) {
             console.error('AI choose error:', e);
+            cardToPlay = null;
+        }
+
+        // ✅ FIX: guaranteed non-empty fallback — always play SOMETHING
+        // rather than doing nothing and stalling the whole table.
+        if (!cardToPlay && b.hand.length > 0) {
             cardToPlay = b.hand[0];
         }
 
         if (cardToPlay) {
             handleMove(roomId, botId, cardToPlay);
-        } else if (b.hand.length > 0) {
-            handleMove(roomId, botId, b.hand[0]);
+        } else {
+            // Truly nothing to play (empty hand) — let the watchdog resolve turn.
+            ensureTurnProgress(roomId, botId);
         }
     }, delay);
 }
@@ -312,6 +416,10 @@ function handleMove(roomId, playerId, card) {
         // Stale card reference (bot) — play any card
         if (player.isBot && player.hand.length > 0) {
             return handleMove(roomId, playerId, player.hand[0]);
+        }
+        // ✅ FIX: no valid card to play at all — don't leave turn dangling.
+        if (player.isBot) {
+            ensureTurnProgress(roomId, playerId);
         }
         return;
     }
@@ -372,10 +480,10 @@ function handleMove(roomId, playerId, card) {
                 if (!r.gameStarted) return; // game ended
 
                 // Winner who collected must lead next
-                let nextTurn = loadedPlayerId;
-                if (!nextTurn || r.winners.some(w => w.id === nextTurn)) {
-                    nextTurn = getNextPlayer(r, playerId);
-                }
+                // ✅ FIX: use resolveValidTurn so a null/ranked candidate
+                // always falls back to a real alive player instead of
+                // leaving currentTurn stuck.
+                let nextTurn = resolveValidTurn(r, loadedPlayerId, playerId);
                 r.currentTurn = nextTurn;
 
                 io.to(roomId).emit('strikeOccurred', {
@@ -393,6 +501,9 @@ function handleMove(roomId, playerId, card) {
                 if (nextTurn && nextTurn.startsWith('bot-')) {
                     scheduleBotTurn(roomId, nextTurn, 1500);
                 }
+
+                // ✅ FIX: watchdog pass in case nextTurn still somehow invalid
+                ensureTurnProgress(roomId, loadedPlayerId || playerId);
             }, 1200);
             return;
         }
@@ -417,7 +528,12 @@ function handleMove(roomId, playerId, card) {
             if (!r || !r.gameStarted) return;
 
             const leadSuit = r.table[0]?.symbol;
-            if (!leadSuit) return;
+            if (!leadSuit) {
+                // ✅ FIX: nothing to resolve (table already cleared by a
+                // concurrent path) — don't just return and leave turn null.
+                ensureTurnProgress(roomId, playerId);
+                return;
+            }
 
             const trickSnapshot = [...r.table];
             const highestLead = getHighestLeadCard(trickSnapshot, leadSuit);
@@ -431,10 +547,11 @@ function handleMove(roomId, playerId, card) {
             updateWinners(roomId);
             if (!r.gameStarted) return; // game ended
 
+            // ✅ FIX: use resolveValidTurn for guaranteed fallback instead of
+            // relying solely on getNextStarterFromTable / getNextPlayer,
+            // either of which can return null and stall the room.
             let nextStarter = getNextStarterFromTable(r, trickSnapshot, leadSuit);
-            if (!nextStarter || r.winners.some(w => w.id === nextStarter)) {
-                nextStarter = getNextPlayer(r, roundWinnerId || r.players[0].id);
-            }
+            nextStarter = resolveValidTurn(r, nextStarter, roundWinnerId || playerId);
 
             r.currentTurn = nextStarter;
 
@@ -449,12 +566,20 @@ function handleMove(roomId, playerId, card) {
             if (nextStarter && nextStarter.startsWith('bot-')) {
                 scheduleBotTurn(roomId, nextStarter, 1500);
             }
+
+            // ✅ FIX: watchdog pass in case nextStarter still somehow invalid
+            ensureTurnProgress(roomId, roundWinnerId || playerId);
         }, 1200);
         return;
     }
 
     // ── Pass turn to next player in ongoing trick ─────────────────
-    const nextTurnId = getNextPlayer(room, playerId);
+    let nextTurnId = getNextPlayer(room, playerId);
+    // ✅ FIX: guaranteed fallback instead of just calling updateWinners and
+    // leaving currentTurn stale/null when getNextPlayer can't find anyone
+    // (can happen transiently if ranks changed mid-trick).
+    nextTurnId = resolveValidTurn(room, nextTurnId, playerId);
+
     if (!nextTurnId) {
         updateWinners(roomId);
         return;
@@ -607,6 +732,10 @@ io.on("connection", (socket) => {
         if (room.currentTurn && room.currentTurn.startsWith('bot-')) {
             scheduleBotTurn(roomId, room.currentTurn, 1500);
         }
+
+        // ✅ FIX: safety net right after deal in case starter resolution
+        // ever ends up pointing at an invalid player (e.g., future rule change).
+        setTimeout(() => ensureTurnProgress(roomId, room.currentTurn), 2500);
     });
 
     socket.on("requestMyCards", ({ roomId }) => {
@@ -621,6 +750,15 @@ io.on("connection", (socket) => {
         if (!room || !room.gameStarted) return;
         if (room.currentTurn !== socket.id) return;
         handleMove(roomId, socket.id, card);
+    });
+
+    // ✅ FIX: lightweight client-triggerable nudge. If a client ever
+    // observes a stalled turn (e.g. after reconnect), it can ask the
+    // server to re-validate and resume without needing a restart.
+    socket.on("requestTurnCheck", ({ roomId }) => {
+        const room = rooms[roomId];
+        if (!room || !room.gameStarted) return;
+        ensureTurnProgress(roomId, socket.id);
     });
 
     socket.on("disconnect", () => {
