@@ -5,11 +5,21 @@ import cors from 'cors';
 
 const app = express();
 app.use(cors({ origin: "*" }));
+
+// Health endpoints: lets the app (or an uptime pinger such as UptimeRobot)
+// wake the Render server with a cheap request.
+app.get('/', (req, res) => res.send('Donkey server OK'));
+app.get('/health', (req, res) => res.json({ ok: true }));
+
 const server = http.createServer(app);
 
 const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"], credentials: true },
-    transports: ['polling', 'websocket']
+    // NOTE: credentials:true removed - it is invalid together with origin "*"
+    // and the client does not send credentials anyway.
+    cors: { origin: "*", methods: ["GET", "POST"] },
+    transports: ['polling', 'websocket'],
+    pingInterval: 10000,
+    pingTimeout: 20000
 });
 
 // ─────────────────────────────────────────────
@@ -33,7 +43,13 @@ const createShuffledDeck = () => {
             });
         });
     });
-    return deck.sort(() => Math.random() - 0.5);
+
+    // Fisher-Yates shuffle (unbiased, replaces sort(() => Math.random() - 0.5))
+    for (let i = deck.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [deck[i], deck[j]] = [deck[j], deck[i]];
+    }
+    return deck;
 };
 
 const sortHandBySuitAndValue = (hand) => {
@@ -183,6 +199,30 @@ function ensureTurnProgress(roomId, anchorId) {
     }
 }
 
+// ✅ NEW: if the player whose turn it is has been disconnected for 6s+,
+// play a card for them so a dropped connection never freezes the table.
+// Uses the same AI card choosers and the normal handleMove path, so all
+// game rules / scoring / turn order stay exactly the same.
+function autoPlayIfDisconnected(roomId) {
+    const room = rooms[roomId];
+    if (!room || !room.gameStarted || !room.currentTurn) return;
+    const p = room.players.find(x => x.id === room.currentTurn);
+    if (!p || p.isBot || p.isConnected !== false) return;
+    if (Date.now() - (p.disconnectedAt || 0) < 6000) return;
+    if (!p.hand || p.hand.length === 0) return;
+
+    let card = null;
+    try {
+        card = room.table.length === 0
+            ? chooseLeadCard(room, p.id)
+            : chooseFollowCard(room, p.id);
+    } catch (e) {
+        console.error('Auto-play choose error:', e);
+    }
+    if (!card) card = p.hand[0];
+    if (card) handleMove(roomId, p.id, card);
+}
+
 // ✅ FIX: periodic liveness sweep, one per room, running for the lifetime
 // of an active game. This is what actually guarantees "never stuck
 // forever" for the bot-timer-race case above — ensureTurnProgress is only
@@ -202,6 +242,8 @@ function startRoomWatchdogSweep(roomId) {
             clearInterval(room._sweepInterval);
             return;
         }
+        // ✅ NEW: keep the table moving if the current human has dropped
+        autoPlayIfDisconnected(roomId);
         ensureTurnProgress(roomId, r.currentTurn);
     }, 2000);
 }
@@ -594,8 +636,12 @@ function handleMove(roomId, playerId, card) {
                 let nextTurn = resolveValidTurn(r, loadedPlayerId, playerId);
                 r.currentTurn = nextTurn;
 
+                // ✅ FIX: winner = player who collects the cards,
+                // loser = player who played the off-suit (striker) card.
+                // The client reads data.winner / data.loser this way.
                 io.to(roomId).emit('strikeOccurred', {
-                    loser: loadedPlayerId,
+                    winner: loadedPlayerId,
+                    loser: playerId,
                     table: trickCards,
                     nextTurn,
                     updatedHand: loadedPlayer?.hand || [],
@@ -877,11 +923,30 @@ io.on("connection", (socket) => {
         if (player?.hand?.length > 0) socket.emit("yourCards", player.hand);
     });
 
-    socket.on("playCard", ({ roomId, card }) => {
+    // ✅ UPDATED: validates the move on the server (turn, card ownership,
+    // follow-suit) and acknowledges the client via callback, which the client
+    // already expects (response.success === false => revert card).
+    // The opening Ace-of-Spades rule is intentionally left to the client,
+    // because a cut on the first trick moves the ace to another player.
+    socket.on("playCard", ({ roomId, card }, callback) => {
         const room = rooms[roomId];
-        if (!room || !room.gameStarted) return;
-        if (room.currentTurn !== socket.id) return;
-        handleMove(roomId, socket.id, card);
+        if (!room || !room.gameStarted) return callback?.({ success: false, message: 'Game not active' });
+        if (room.currentTurn !== socket.id) return callback?.({ success: false, message: 'Not your turn' });
+
+        const player = room.players.find(p => p.id === socket.id);
+        const cardInHand = player?.hand?.find(c => c.id === card?.id);
+        if (!cardInHand) return callback?.({ success: false, message: 'Card not in hand' });
+
+        if (room.table.length > 0) {
+            const leadSuit = room.table[0].symbol;
+            const hasLead = player.hand.some(c => c.symbol === leadSuit);
+            if (hasLead && cardInHand.symbol !== leadSuit) {
+                return callback?.({ success: false, message: 'You must follow suit' });
+            }
+        }
+
+        handleMove(roomId, socket.id, cardInHand);
+        callback?.({ success: true });
     });
 
     // ✅ FIX: lightweight client-triggerable nudge. If a client ever
@@ -900,10 +965,13 @@ io.on("connection", (socket) => {
             const player = room.players.find(p => p.id === socket.id);
             if (!player) continue;
             player.isConnected = false;
+            player.disconnectedAt = Date.now(); // ✅ NEW: used by autoPlayIfDisconnected
             io.to(roomId).emit("playersUpdated", room.players.map(({ hand, ...rest }) => rest));
             const humansOnline = room.players.some(p => !p.isBot && p.isConnected);
             if (!humansOnline) {
                 console.log(`Deleting empty room ${roomId}`);
+                if (room._sweepInterval) { clearInterval(room._sweepInterval); room._sweepInterval = null; }
+                delete _humanWatchdogTokens[roomId]; // ✅ NEW: avoid leaking tokens
                 delete rooms[roomId];
             }
             break;
